@@ -18,20 +18,25 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "pg_glue.h"
 
 extern "C" {
 #include <access/reloptions.h>
+#include <catalog/pg_type.h>
 #include <catalog/pg_foreign_server.h>
 #include <catalog/pg_user_mapping.h>
 #include <commands/defrem.h>
 #include <foreign/foreign.h>
 #include <miscadmin.h>
 #include <utils/acl.h>
+#include <utils/array.h>
 #include <utils/builtins.h>
 #include <utils/syscache.h>
 
@@ -41,6 +46,8 @@ PG_FUNCTION_INFO_V1(sc_redis_get);
 PG_FUNCTION_INFO_V1(sc_redis_del);
 PG_FUNCTION_INFO_V1(sc_redis_hset);
 PG_FUNCTION_INFO_V1(sc_redis_hget);
+PG_FUNCTION_INFO_V1(sc_redis_hmget);
+PG_FUNCTION_INFO_V1(sc_redis_hgetall);
 }
 
 namespace {
@@ -169,8 +176,60 @@ namespace {
         bool found = false; // get/hget: there was a value
         long long count = 0;
         struct varlena *value = nullptr;
+        char *json = nullptr; // hmget/hgetall: JSON text for jsonb_in
         sc_pglib::pending_error error;
     };
+
+    // The elements of a text[] argument. Plain data, filled while PostgreSQL may still raise.
+    struct text_list {
+        const char **data = nullptr;
+        int *lengths = nullptr;
+        int count = 0;
+    };
+
+    text_list texts_from(ArrayType *array, const char *what) {
+        Datum *elements = nullptr;
+        bool *nulls = nullptr;
+        text_list list;
+        deconstruct_array(array, TEXTOID, -1, false, TYPALIGN_INT, &elements, &nulls, &list.count);
+        list.data = static_cast<const char **>(palloc(sizeof(char *) * (list.count + 1)));
+        list.lengths = static_cast<int *>(palloc(sizeof(int) * (list.count + 1)));
+        for (int i = 0; i < list.count; ++i) {
+            if (nulls[i]) {
+                ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("%s must not contain NULL", what)));
+            }
+            const struct varlena *element = pg_detoast_datum_packed(reinterpret_cast<struct varlena *>(DatumGetPointer(elements[i])));
+            list.data[i] = VARDATA_ANY(element);
+            list.lengths[i] = static_cast<int>(VARSIZE_ANY_EXHDR(element));
+        }
+        return list;
+    }
+
+    // Appends text as a JSON string. Redis values are bytes; jsonb_in later rejects anything
+    // that isn't valid in the database encoding.
+    void append_json_string(std::string &json, const std::string_view text) {
+        json += '"';
+        for (const char c: text) {
+            switch (c) {
+                case '"': json += "\\\""; break;
+                case '\\': json += "\\\\"; break;
+                case '\n': json += "\\n"; break;
+                case '\r': json += "\\r"; break;
+                case '\t': json += "\\t"; break;
+                case '\b': json += "\\b"; break;
+                case '\f': json += "\\f"; break;
+                default:
+                    if (static_cast<unsigned char>(c) < 0x20) {
+                        char escaped[8];
+                        snprintf(escaped, sizeof escaped, "\\u%04x", static_cast<unsigned char>(c));
+                        json += escaped;
+                    } else {
+                        json += c;
+                    }
+            }
+        }
+        json += '"';
+    }
 
     // Runs command (sc::redis &, outcome &) on s's client, connecting first if needed.
     template<typename Command>
@@ -335,4 +394,54 @@ extern "C" Datum sc_redis_hget(PG_FUNCTION_ARGS) {
     result.error.raise();
     if (!result.found || !result.value) PG_RETURN_NULL();
     PG_RETURN_TEXT_P(result.value);
+}
+
+// sc_redis_hmget(server, key, fields text[]) -> jsonb: {"field": "value" or null, ...} for the
+// requested fields (null where there's no such field), or NULL when it failed
+extern "C" Datum sc_redis_hmget(PG_FUNCTION_ARGS) {
+    const settings s = settings_for(PG_GETARG_TEXT_PP(0));
+    const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
+    const text_list fields = texts_from(PG_GETARG_ARRAYTYPE_P(2), "fields");
+    const outcome result = run(s, [key, fields](sc::redis &redis, outcome &out) {
+        std::vector<std::string> names;
+        names.reserve(static_cast<std::size_t>(fields.count));
+        for (int i = 0; i < fields.count; ++i) names.emplace_back(fields.data[i], static_cast<std::size_t>(fields.lengths[i]));
+        const auto values = redis.hmget(std::string{key}, names);
+        std::string json = "{";
+        for (std::size_t i = 0; i < names.size() && i < values.size(); ++i) {
+            if (i) json += ", ";
+            append_json_string(json, names[i]);
+            json += ": ";
+            if (values[i]) append_json_string(json, *values[i]);
+            else json += "null";
+        }
+        json += '}';
+        out.json = sc_pglib::new_cstring(json, out.error);
+    });
+    result.error.raise();
+    if (!result.done || !result.json) PG_RETURN_NULL();
+    PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(result.json)));
+}
+
+// sc_redis_hgetall(server, key) -> jsonb: every field of the hash ({} when there's no such key),
+// or NULL when it failed
+extern "C" Datum sc_redis_hgetall(PG_FUNCTION_ARGS) {
+    const settings s = settings_for(PG_GETARG_TEXT_PP(0));
+    const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
+    const outcome result = run(s, [key](sc::redis &redis, outcome &out) {
+        std::string json = "{";
+        bool first = true;
+        for (const auto &[field, value]: redis.hgetall(std::string{key})) {
+            if (!first) json += ", ";
+            first = false;
+            append_json_string(json, field);
+            json += ": ";
+            append_json_string(json, value);
+        }
+        json += '}';
+        out.json = sc_pglib::new_cstring(json, out.error);
+    });
+    result.error.raise();
+    if (!result.done || !result.json) PG_RETURN_NULL();
+    PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(result.json)));
 }
