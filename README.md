@@ -11,6 +11,17 @@ SELECT sc_base64_encode('\x00ff10e9'::bytea);                         -- AP8Q6Q=
 SELECT convert_from(sc_base64_decode('SGVsbG8gV29ybGQh'), 'UTF8');    -- Hello World!
 ```
 
+The apt package is built for each Ubuntu release's own PostgreSQL:
+
+| Ubuntu | PostgreSQL | Package depends on |
+|---|---|---|
+| noble (24.04) | 16 | `postgresql-16` |
+| resolute (26.04) | 18 | `postgresql-18` |
+| jammy (22.04) | not built | Ubuntu's PostgreSQL server headers aren't available on the build server |
+
+A server running another PostgreSQL version (for example from the PGDG
+repository) needs a build against that version; see Building.
+
 This first version is a proof of concept wrapping `sc::base64`:
 
 | Function | Returns | Notes |
