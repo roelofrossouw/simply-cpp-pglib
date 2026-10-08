@@ -1,17 +1,27 @@
 # simply-cpp-pglib
 
 `sc-pglib` packages simply-cpp functions as a PostgreSQL extension. Install the
-package on the database server, then enable it per database:
+package on the database server, then enable it per database.
 
-```sql
-CREATE EXTENSION sc_pglib;
+## Install
 
-SELECT sc_base64_encode('Hello World!');                              -- SGVsbG8gV29ybGQh
-SELECT sc_base64_encode('\x00ff10e9'::bytea);                         -- AP8Q6Q==
-SELECT convert_from(sc_base64_decode('SGVsbG8gV29ybGQh'), 'UTF8');    -- Hello World!
+On the database server, register the simply-cpp apt repository and install the
+package:
+
+```bash
+curl -fsSL https://apt.roelof.co.za/setup.sh | bash
+apt install simply-cpp-pglib
 ```
 
-The apt package is built for each Ubuntu release's own PostgreSQL:
+Then create the extension in each database that should have it. That takes a
+superuser, such as `postgres`:
+
+```bash
+sudo -u postgres psql -d mydb -c "CREATE EXTENSION sc_pglib;"
+```
+
+The package is built for one PostgreSQL version per Ubuntu release and depends on
+it, so the server must run that version:
 
 | Ubuntu | PostgreSQL | Package depends on |
 |---|---|---|
@@ -23,6 +33,16 @@ jammy is the exception: Ubuntu's own PostgreSQL there is 14, but the jammy
 package targets PostgreSQL 16 from the PGDG repository, which is what our jammy
 database servers run. A server with another PostgreSQL version needs a build
 against that version; see Building.
+
+## Usage
+
+```sql
+CREATE EXTENSION sc_pglib;
+
+SELECT sc_base64_encode('Hello World!');                              -- SGVsbG8gV29ybGQh
+SELECT sc_base64_encode('\x00ff10e9'::bytea);                         -- AP8Q6Q==
+SELECT convert_from(sc_base64_decode('SGVsbG8gV29ybGQh'), 'UTF8');    -- Hello World!
+```
 
 This first version is a proof of concept wrapping `sc::base64`:
 
