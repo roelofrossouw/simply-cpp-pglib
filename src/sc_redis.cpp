@@ -1,0 +1,338 @@
+// Redis from SQL (sc::redis). Connection settings live in PostgreSQL's foreign server catalog,
+// as dblink and postgres_fdw do it: a server of the sc_redis foreign data wrapper holds the
+// Redis servers and timeouts, and an optional user mapping holds the password.
+//
+// Each session (backend process) keeps one client per foreign server and reuses it, so a call
+// costs one Redis round trip, not a connection. Changing the server's or user mapping's options
+// makes the next call reconnect with the new ones.
+//
+// Calls aren't transactional: a write happens at once, and stays when the transaction rolls back.
+// When Redis is unavailable a call fails fast instead of waiting on every row: after a failed
+// connection the server is skipped for retry_interval_ms. With on_error 'warning' (the default)
+// failures are WARNINGs and the call returns false or NULL, so a trigger never breaks the
+// statement that fired it; with on_error 'error' they are ERRORs.
+
+#include <ip_endpoints.h>
+#include <redis.h>
+
+#include <cerrno>
+#include <chrono>
+#include <cstdlib>
+#include <memory>
+#include <string>
+#include <unordered_map>
+
+#include "pg_glue.h"
+
+extern "C" {
+#include <access/reloptions.h>
+#include <catalog/pg_foreign_server.h>
+#include <catalog/pg_user_mapping.h>
+#include <commands/defrem.h>
+#include <foreign/foreign.h>
+#include <miscadmin.h>
+#include <utils/acl.h>
+#include <utils/builtins.h>
+#include <utils/syscache.h>
+
+PG_FUNCTION_INFO_V1(sc_redis_validator);
+PG_FUNCTION_INFO_V1(sc_redis_set);
+PG_FUNCTION_INFO_V1(sc_redis_get);
+PG_FUNCTION_INFO_V1(sc_redis_del);
+PG_FUNCTION_INFO_V1(sc_redis_hset);
+PG_FUNCTION_INFO_V1(sc_redis_hget);
+}
+
+namespace {
+    constexpr const char *wrapper_name = "sc_redis";
+
+    // One foreign server's settings. Plain data: it is filled while PostgreSQL may still raise.
+    struct settings {
+        Oid server = InvalidOid;
+        const char *name = nullptr;
+        const char *servers = nullptr;
+        const char *password = nullptr;
+        int connect_timeout_ms = 1000;
+        int timeout_ms = 1000;
+        int retry_interval_ms = 10000;
+        bool raise_errors = false;
+    };
+
+    bool is_server_option(const char *name) {
+        for (const char *known: {"servers", "connect_timeout_ms", "timeout_ms", "retry_interval_ms", "on_error"}) {
+            if (std::strcmp(name, known) == 0) return true;
+        }
+        return false;
+    }
+
+    // A whole number of milliseconds from minimum to an hour, or -1.
+    int milliseconds(const char *text, const int minimum) {
+        char *end = nullptr;
+        errno = 0;
+        const long value = std::strtol(text, &end, 10);
+        if (errno || end == text || *end || value < minimum || value > 3600000) return -1;
+        return static_cast<int>(value);
+    }
+
+    // Applies one server option to s; returns a problem with its value, or nullptr.
+    const char *apply_server_option(settings &s, const char *name, const char *value) {
+        if (std::strcmp(name, "servers") == 0) {
+            s.servers = value;
+        } else if (std::strcmp(name, "connect_timeout_ms") == 0) {
+            if ((s.connect_timeout_ms = milliseconds(value, 1)) < 0) return "connect_timeout_ms must be 1 to 3600000";
+        } else if (std::strcmp(name, "timeout_ms") == 0) {
+            if ((s.timeout_ms = milliseconds(value, 1)) < 0) return "timeout_ms must be 1 to 3600000";
+        } else if (std::strcmp(name, "retry_interval_ms") == 0) {
+            if ((s.retry_interval_ms = milliseconds(value, 0)) < 0) return "retry_interval_ms must be 0 to 3600000";
+        } else if (std::strcmp(name, "on_error") == 0) {
+            if (std::strcmp(value, "warning") == 0) s.raise_errors = false;
+            else if (std::strcmp(value, "error") == 0) s.raise_errors = true;
+            else return "on_error must be 'warning' or 'error'";
+        }
+        return nullptr;
+    }
+
+    // Checks a servers option, which sc::ip_endpoints parses; C++, so it reports through error.
+    void check_servers(const char *servers, sc_pglib::pending_error &error) noexcept {
+        try {
+            if (sc::ip_endpoints{servers}.empty()) {
+                error.set(ERRCODE_FDW_INVALID_ATTRIBUTE_VALUE, ERROR, "servers must name at least one Redis server");
+            }
+        } catch (const std::exception &exception) {
+            error.set(ERRCODE_FDW_INVALID_ATTRIBUTE_VALUE, ERROR, "invalid servers option: %s", exception.what());
+        }
+    }
+
+    // The current user's mapping options for server, or PUBLIC's; none at all means no password.
+    List *mapping_options(const Oid server) {
+        HeapTuple tuple = SearchSysCache2(USERMAPPINGUSERSERVER, ObjectIdGetDatum(GetUserId()), ObjectIdGetDatum(server));
+        if (!HeapTupleIsValid(tuple)) {
+            tuple = SearchSysCache2(USERMAPPINGUSERSERVER, ObjectIdGetDatum(InvalidOid), ObjectIdGetDatum(server));
+        }
+        if (!HeapTupleIsValid(tuple)) return NIL;
+        bool is_null = false;
+        const Datum datum = SysCacheGetAttr(USERMAPPINGUSERSERVER, tuple, Anum_pg_user_mapping_umoptions, &is_null);
+        List *options = is_null ? NIL : untransformRelOptions(datum);
+        ReleaseSysCache(tuple);
+        return options;
+    }
+
+    // The settings of the named sc_redis server, checking the current user may use it.
+    settings settings_for(text *name_argument) {
+        const char *name = text_to_cstring(name_argument);
+        ForeignServer *server = GetForeignServerByName(name, false);
+        if (std::strcmp(GetForeignDataWrapper(server->fdwid)->fdwname, wrapper_name) != 0) {
+            ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                            errmsg("server \"%s\" is not a %s server", name, wrapper_name)));
+        }
+#if PG_VERSION_NUM >= 160000
+        const AclResult access = object_aclcheck(ForeignServerRelationId, server->serverid, GetUserId(), ACL_USAGE);
+#else
+        const AclResult access = pg_foreign_server_aclcheck(server->serverid, GetUserId(), ACL_USAGE);
+#endif
+        if (access != ACLCHECK_OK) aclcheck_error(access, OBJECT_FOREIGN_SERVER, server->servername);
+
+        settings s;
+        s.server = server->serverid;
+        s.name = server->servername;
+        ListCell *cell;
+        foreach(cell, server->options) {
+            const auto *option = static_cast<DefElem *>(lfirst(cell));
+            apply_server_option(s, option->defname, defGetString(const_cast<DefElem *>(option)));
+        }
+        foreach(cell, mapping_options(server->serverid)) {
+            const auto *option = static_cast<DefElem *>(lfirst(cell));
+            if (std::strcmp(option->defname, "password") == 0) s.password = defGetString(const_cast<DefElem *>(option));
+        }
+        if (!s.servers) {
+            ereport(ERROR, (errcode(ERRCODE_FDW_OPTION_NAME_NOT_FOUND),
+                            errmsg("server \"%s\" has no servers option", name)));
+        }
+        return s;
+    }
+
+    // The session's client for one foreign server.
+    struct client_entry {
+        std::string signature; // the settings it was made with
+        std::unique_ptr<sc::redis> client;
+        std::chrono::steady_clock::time_point retry_at{}; // after an outage: not tried before this
+    };
+
+    std::unordered_map<Oid, client_entry> &clients() {
+        static std::unordered_map<Oid, client_entry> per_server;
+        return per_server;
+    }
+
+    // How a call went, as plain data that outlives the call's C++ objects.
+    struct outcome {
+        bool done = false;  // the command ran
+        bool found = false; // get/hget: there was a value
+        long long count = 0;
+        struct varlena *value = nullptr;
+        sc_pglib::pending_error error;
+    };
+
+    // Runs command (sc::redis &, outcome &) on s's client, connecting first if needed.
+    template<typename Command>
+    outcome run(const settings &s, Command command) noexcept {
+        outcome result;
+        const int failure_level = s.raise_errors ? ERROR : WARNING;
+        client_entry *entry = nullptr;
+        try {
+            entry = &clients()[s.server];
+            const std::string signature = std::string{s.servers} + '\n' + (s.password ? s.password : "") + '\n' +
+                                          std::to_string(s.connect_timeout_ms) + ' ' + std::to_string(s.timeout_ms);
+            if (entry->signature != signature) *entry = client_entry{signature, nullptr, {}};
+
+            if (!entry->client) {
+                if (std::chrono::steady_clock::now() < entry->retry_at) {
+                    // Still pausing after an outage, which was reported then: skip it quietly
+                    // rather than wait on Redis again (unless errors are wanted).
+                    if (s.raise_errors) {
+                        result.error.set(ERRCODE_CONNECTION_FAILURE, ERROR,
+                                         "Redis server \"%s\" is unavailable (not retried yet)", s.name);
+                    }
+                    return result;
+                }
+                sc::redis_options options;
+                options.password = s.password ? s.password : "";
+                options.connect_timeout = std::chrono::milliseconds{s.connect_timeout_ms};
+                options.command_timeout = std::chrono::milliseconds{s.timeout_ms};
+                entry->client = std::make_unique<sc::redis>(sc::ip_endpoints{s.servers}, options);
+            }
+            command(*entry->client, result);
+            result.done = true;
+        } catch (const sc::redis_unavailable &exception) {
+            if (entry) {
+                entry->client.reset();
+                entry->retry_at = std::chrono::steady_clock::now() + std::chrono::milliseconds{s.retry_interval_ms};
+            }
+            result.error.set(ERRCODE_CONNECTION_FAILURE, failure_level,
+                             "Redis server \"%s\" is unavailable, skipping it for %d ms: %s",
+                             s.name, s.retry_interval_ms, exception.what());
+        } catch (const std::exception &exception) {
+            result.error.set(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION, failure_level, "Redis server \"%s\": %s",
+                             s.name, exception.what());
+        } catch (...) {
+            result.error.set(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION, failure_level,
+                             "Redis server \"%s\": unexpected C++ exception", s.name);
+        }
+        return result;
+    }
+}
+
+// sc_redis_validator(text[], oid): checks options as they are set on the sc_redis wrapper's
+// servers (servers, connect_timeout_ms, timeout_ms, retry_interval_ms, on_error) and user
+// mappings (password).
+extern "C" Datum sc_redis_validator(PG_FUNCTION_ARGS) {
+    List *options = untransformRelOptions(PG_GETARG_DATUM(0));
+    const Oid catalog = PG_GETARG_OID(1);
+    settings s;
+    bool has_servers = false;
+    ListCell *cell;
+    foreach(cell, options) {
+        auto *option = static_cast<DefElem *>(lfirst(cell));
+        const char *value = defGetString(option);
+        if (catalog == ForeignServerRelationId) {
+            if (!is_server_option(option->defname)) {
+                ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                                errmsg("invalid option \"%s\" for a %s server", option->defname, wrapper_name),
+                                errhint("Valid options are servers, connect_timeout_ms, timeout_ms, "
+                                        "retry_interval_ms and on_error.")));
+            }
+            if (const char *problem = apply_server_option(s, option->defname, value)) {
+                ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_ATTRIBUTE_VALUE), errmsg("%s", problem)));
+            }
+            if (std::strcmp(option->defname, "servers") == 0) {
+                has_servers = true;
+                sc_pglib::pending_error error;
+                check_servers(value, error);
+                error.raise();
+            }
+        } else if (catalog == UserMappingRelationId) {
+            if (std::strcmp(option->defname, "password") != 0) {
+                ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                                errmsg("invalid option \"%s\" for a %s user mapping", option->defname, wrapper_name),
+                                errhint("The only valid option is password.")));
+            }
+        } else {
+            ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                            errmsg("%s takes options only on servers and user mappings", wrapper_name)));
+        }
+    }
+    if (catalog == ForeignServerRelationId && !has_servers) {
+        ereport(ERROR, (errcode(ERRCODE_FDW_OPTION_NAME_NOT_FOUND),
+                        errmsg("a %s server needs the servers option", wrapper_name),
+                        errhint("For example: OPTIONS (servers 'redis1;redis2:6380')")));
+    }
+    PG_RETURN_VOID();
+}
+
+// sc_redis_set(server, key, value) -> boolean: whether it was stored
+extern "C" Datum sc_redis_set(PG_FUNCTION_ARGS) {
+    const settings s = settings_for(PG_GETARG_TEXT_PP(0));
+    // Fetched (and detoasted, which may allocate) before the C++ part.
+    const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
+    const std::string_view value = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(2));
+    const outcome result = run(s, [key, value](sc::redis &redis, outcome &) {
+        redis.set(std::string{key}, std::string{value});
+    });
+    result.error.raise();
+    PG_RETURN_BOOL(result.done);
+}
+
+// sc_redis_get(server, key) -> text, or NULL when there is no such key (or it failed)
+extern "C" Datum sc_redis_get(PG_FUNCTION_ARGS) {
+    const settings s = settings_for(PG_GETARG_TEXT_PP(0));
+    const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
+    const outcome result = run(s, [key](sc::redis &redis, outcome &out) {
+        if (const auto value = redis.get(std::string{key})) {
+            out.found = true;
+            out.value = sc_pglib::new_varlena(*value, out.error);
+        }
+    });
+    result.error.raise();
+    if (!result.found || !result.value) PG_RETURN_NULL();
+    PG_RETURN_TEXT_P(result.value);
+}
+
+// sc_redis_del(server, key) -> bigint: keys removed (0 or 1), or NULL when it failed
+extern "C" Datum sc_redis_del(PG_FUNCTION_ARGS) {
+    const settings s = settings_for(PG_GETARG_TEXT_PP(0));
+    const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
+    const outcome result = run(s, [key](sc::redis &redis, outcome &out) {
+        out.count = static_cast<long long>(redis.erase(std::string{key}));
+    });
+    result.error.raise();
+    if (!result.done) PG_RETURN_NULL();
+    PG_RETURN_INT64(result.count);
+}
+
+// sc_redis_hset(server, key, field, value) -> boolean: whether it was stored
+extern "C" Datum sc_redis_hset(PG_FUNCTION_ARGS) {
+    const settings s = settings_for(PG_GETARG_TEXT_PP(0));
+    const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
+    const std::string_view field = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(2));
+    const std::string_view value = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(3));
+    const outcome result = run(s, [key, field, value](sc::redis &redis, outcome &) {
+        redis.hset(std::string{key}, std::string{field}, std::string{value});
+    });
+    result.error.raise();
+    PG_RETURN_BOOL(result.done);
+}
+
+// sc_redis_hget(server, key, field) -> text, or NULL when there is no such field (or it failed)
+extern "C" Datum sc_redis_hget(PG_FUNCTION_ARGS) {
+    const settings s = settings_for(PG_GETARG_TEXT_PP(0));
+    const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
+    const std::string_view field = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(2));
+    const outcome result = run(s, [key, field](sc::redis &redis, outcome &out) {
+        if (const auto value = redis.hget(std::string{key}, std::string{field})) {
+            out.found = true;
+            out.value = sc_pglib::new_varlena(*value, out.error);
+        }
+    });
+    result.error.raise();
+    if (!result.found || !result.value) PG_RETURN_NULL();
+    PG_RETURN_TEXT_P(result.value);
+}
