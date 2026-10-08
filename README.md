@@ -57,7 +57,7 @@ All are `IMMUTABLE STRICT PARALLEL SAFE`: a `NULL` argument gives `NULL`.
 
 ## Redis
 
-`sc_pglib` 1.1 talks to Redis (standalone or Cluster) through `sc::redis`, mainly
+`sc_pglib` talks to Redis (standalone or Cluster) through `sc::redis`, mainly
 so triggers can keep Redis up to date for other programs to read. Connection
 settings are a foreign server of the `sc_redis` wrapper, as `dblink` does it:
 
@@ -84,6 +84,13 @@ GRANT USAGE ON FOREIGN SERVER cache TO app;
 | `sc_redis_del(server, key)` | `bigint`: keys removed |
 | `sc_redis_hset(server, key, field, value)` | `boolean`: stored |
 | `sc_redis_hget(server, key, field)` | `text`, `NULL` when there's no such field |
+| `sc_redis_hmget(server, key, fields text[])` | `jsonb`: `{"field": "value", ...}` for the requested fields, `null` for missing ones |
+| `sc_redis_hgetall(server, key)` | `jsonb`: every field of the hash, `{}` when there's no such key |
+
+```sql
+SELECT sc_redis_hmget('cache', 'vehicle:1', array['name', 'colour']);  -- {"name": "first", "colour": null}
+SELECT sc_redis_hgetall('cache', 'vehicle:1') ->> 'name';                 -- first
+```
 
 A trigger keeping a hash per row up to date:
 
@@ -128,12 +135,12 @@ How it behaves:
   nothing that can raise a PostgreSQL error runs while a C++ object is alive,
   because `ereport()` `longjmp()`s past destructors.
 - `sql/sc_pglib.control` and the `sql/sc_pglib--*.sql` scripts are what `CREATE
-  EXTENSION` reads: `sc_pglib--1.0.sql` (base64) and the `1.0--1.1` update
-  (Redis). They and the module install into the server's own directories
+  EXTENSION` reads: `sc_pglib--1.0.sql` (base64) and the updates `1.0--1.1`
+  (Redis) and `1.1--1.2` (`hmget`, `hgetall`). They and the module install into the server's own directories
   (`pg_config --sharedir`/extension and `--pkglibdir`).
-- The extension version (`1.1`) is separate from the package version. A package
+- The extension version (`1.2`) is separate from the package version. A package
   update replaces the module in place; adding or changing SQL objects needs a new
-  extension version with an update script (`sc_pglib--1.1--1.2.sql`), after which
+  extension version with an update script (`sc_pglib--1.2--1.3.sql`), after which
   databases run `ALTER EXTENSION sc_pglib UPDATE`.
 
 ## Building

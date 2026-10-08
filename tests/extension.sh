@@ -60,7 +60,7 @@ if [ "$major" -ge 18 ]; then
     check_extension=1
 else
     echo "PostgreSQL $major: running the extension scripts directly (CREATE EXTENSION of an uninstalled extension needs 18)"
-    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql; do
+    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql; do
         sed -e '/^\\echo/d' -e "s|MODULE_PATHNAME|$library|g" "$sql_dir/$step" | psql_run
     done
     check_extension=0
@@ -135,6 +135,7 @@ SQL
 expect "unreachable server warns once" "1" "$(grep -c 'is unavailable, skipping it for 60000 ms' <<<"$output")"
 expect "unreachable server: false, false, NULL, then skipped quickly" "f f t t" "$(grep -vE 'WARNING' <<<"$output" | tr '\n' ' ' | sed 's/ $//')"
 check "~ERROR:  Redis server \"strict\" is unavailable" "create server strict foreign data wrapper sc_redis options (servers '10.255.255.1:6379', connect_timeout_ms '200', on_error 'error'); select sc_redis_get('strict', 'a')"
+check "~fields must not contain NULL" "select sc_redis_hmget('nowhere', 'key', array['a', null])"
 check "~permission denied for foreign server nowhere" "create role sc_pglib_tester; set role sc_pglib_tester; select sc_redis_get('nowhere', 'a')"
 
 if [ -n "${SC_REDIS_DEMO_SERVER:-}" ]; then
@@ -154,6 +155,20 @@ select sc_redis_get('cache', :'prefix' || ':string') is null;
 SQL
     )
     expect "Redis set/get/hset/hget/del" "t Hello World! t t simply-cpp t 1 t" "$(tr '\n' ' ' <<<"$output" | sed 's/ $//')"
+    output=$(session -v prefix="$prefix" <<'SQL'
+select sc_redis_hset('cache', :'prefix' || ':hash', 'name', 'simply-cpp');
+select sc_redis_hset('cache', :'prefix' || ':hash', 'kind', 'demo');
+select sc_redis_hset('cache', :'prefix' || ':hash', 'odd', E'say "hi"\nnext');
+select sc_redis_hmget('cache', :'prefix' || ':hash', array['name', 'missing']);
+select sc_redis_hgetall('cache', :'prefix' || ':hash');
+select sc_redis_hgetall('cache', :'prefix' || ':hash') ->> 'odd' = E'say "hi"\nnext';
+select sc_redis_hgetall('cache', :'prefix' || ':no-such-hash');
+select sc_redis_hmget('cache', :'prefix' || ':hash', array[]::text[]);
+SQL
+    )
+    expect "Redis hmget/hgetall as jsonb" \
+        't t t {"name": "simply-cpp", "missing": null} {"odd": "say \"hi\"\nnext", "kind": "demo", "name": "simply-cpp"} t {} {}' \
+        "$(tr '\n' ' ' <<<"$output" | sed 's/ $//')"
     expect "a Redis error reply (WRONGTYPE) is a warning" "~WRONGTYPE" \
         "$(session -v prefix="$prefix" <<<"select sc_redis_get('cache', :'prefix' || ':hash');")"
 
@@ -206,15 +221,16 @@ else
 fi
 
 if [ "$check_extension" = 1 ]; then
-    check "sc_pglib|1.1" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.2" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "" "set client_min_messages = warning; drop extension sc_pglib cascade"
     check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%')"
     # Updating from 1.0, as an existing database does.
     check "" "create extension sc_pglib version '1.0'"
     check "f" "select exists (select 1 from pg_proc where proname = 'sc_redis_get')"
     check "" "alter extension sc_pglib update"
-    check "sc_pglib|1.1" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.2" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_redis')"
+    check "t" "select exists (select 1 from pg_proc where proname = 'sc_redis_hgetall')"
 fi
 
 if [ "$failures" -ne 0 ]; then

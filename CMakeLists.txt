@@ -20,7 +20,7 @@ message(STATUS "SimplyCPP ${SC_MODULE} Version: ${SC_VERSION}")
 # Dependencies #
 ################
 find_or_install_package(sc-core simply-cpp-dev simply-cpp 1.5.8)
-find_or_install_package(sc-redis simply-cpp-redis-dev simply-cpp-redis 1.1.6)
+find_or_install_package(sc-redis simply-cpp-redis-dev simply-cpp-redis 1.1.7)
 
 ## PostgreSQL server ##
 # An extension is built for one PostgreSQL major version. Each Ubuntu release builds for a fixed
@@ -104,7 +104,7 @@ if (APPLE)
     endif ()
 endif ()
 
-set(SC_PGLIB_EXTENSION_FILES sql/sc_pglib.control sql/sc_pglib--1.0.sql sql/sc_pglib--1.0--1.1.sql)
+set(SC_PGLIB_EXTENSION_FILES sql/sc_pglib.control sql/sc_pglib--1.0.sql sql/sc_pglib--1.0--1.1.sql sql/sc_pglib--1.1--1.2.sql)
 if (SC_PGLIB_INSTALL)
     install(TARGETS sc_pglib LIBRARY DESTINATION "${SC_PGLIB_PG_PKGLIBDIR}" COMPONENT runtime)
     install(FILES ${SC_PGLIB_EXTENSION_FILES} DESTINATION "${SC_PGLIB_PG_SHAREDIR}/extension" COMPONENT runtime)

@@ -74,4 +74,22 @@ namespace sc_pglib {
         std::memcpy(VARDATA(result), bytes.data(), bytes.size());
         return result;
     }
+
+    // A new NUL-terminated copy of bytes (for PostgreSQL input functions such as jsonb_in), or
+    // nullptr with error set when memory runs out. Never raises.
+    inline char *new_cstring(const std::string_view bytes, pending_error &error) {
+        if (!AllocSizeIsValid(bytes.size() + 1)) {
+            error.set(ERRCODE_PROGRAM_LIMIT_EXCEEDED, ERROR, "result exceeds the maximum value size");
+            return nullptr;
+        }
+        auto *result = static_cast<char *>(
+            MemoryContextAllocExtended(CurrentMemoryContext, bytes.size() + 1, MCXT_ALLOC_NO_OOM));
+        if (!result) {
+            error.set(ERRCODE_OUT_OF_MEMORY, ERROR, "out of memory");
+            return nullptr;
+        }
+        std::memcpy(result, bytes.data(), bytes.size());
+        result[bytes.size()] = '\0';
+        return result;
+    }
 }
