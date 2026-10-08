@@ -44,7 +44,7 @@ SELECT sc_base64_encode('\x00ff10e9'::bytea);                         -- AP8Q6Q=
 SELECT convert_from(sc_base64_decode('SGVsbG8gV29ybGQh'), 'UTF8');    -- Hello World!
 ```
 
-This first version is a proof of concept wrapping `sc::base64`:
+The base64 functions wrap `sc::base64`:
 
 | Function | Returns | Notes |
 |---|---|---|
@@ -55,20 +55,86 @@ This first version is a proof of concept wrapping `sc::base64`:
 All are `IMMUTABLE STRICT PARALLEL SAFE`: a `NULL` argument gives `NULL`.
 `DROP EXTENSION sc_pglib` removes them again.
 
+## Redis
+
+`sc_pglib` 1.1 talks to Redis (standalone or Cluster) through `sc::redis`, mainly
+so triggers can keep Redis up to date for other programs to read. Connection
+settings are a foreign server of the `sc_redis` wrapper, as `dblink` does it:
+
+```sql
+CREATE SERVER cache FOREIGN DATA WRAPPER sc_redis OPTIONS (servers 'redis1;redis2:6380');
+-- Only for a Redis that needs a password; per role, or FOR PUBLIC:
+CREATE USER MAPPING FOR PUBLIC SERVER cache OPTIONS (password 'secret');
+-- Other roles need USAGE on the server:
+GRANT USAGE ON FOREIGN SERVER cache TO app;
+```
+
+| Server option | Default | |
+|---|---|---|
+| `servers` | required | one or more `host[:port]`, separated by `;` (port 6379 by default) |
+| `connect_timeout_ms` | `1000` | |
+| `timeout_ms` | `1000` | how long a command waits for its reply |
+| `retry_interval_ms` | `10000` | after Redis was unreachable, how long calls skip it |
+| `on_error` | `warning` | `warning`: a failure is a WARNING and the call returns `false`/`NULL`; `error`: it raises an ERROR |
+
+| Function | Returns |
+|---|---|
+| `sc_redis_set(server, key, value)` | `boolean`: stored |
+| `sc_redis_get(server, key)` | `text`, `NULL` when there's no such key |
+| `sc_redis_del(server, key)` | `bigint`: keys removed |
+| `sc_redis_hset(server, key, field, value)` | `boolean`: stored |
+| `sc_redis_hget(server, key, field)` | `text`, `NULL` when there's no such field |
+
+A trigger keeping a hash per row up to date:
+
+```sql
+CREATE FUNCTION vehicle_to_redis() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        PERFORM sc_redis_del('cache', 'vehicle:' || OLD.id);
+        RETURN OLD;
+    END IF;
+    PERFORM sc_redis_hset('cache', 'vehicle:' || NEW.id, 'name', NEW.name);
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER vehicle_to_redis AFTER INSERT OR UPDATE OR DELETE ON vehicle
+    FOR EACH ROW EXECUTE FUNCTION vehicle_to_redis();
+```
+
+How it behaves:
+
+- **One connection per session.** Each database session (backend process) connects
+  on its first call to a server and keeps that connection, so a call costs one
+  round trip. A connection that broke while idle is replaced transparently.
+  Changing the server's or user mapping's options makes the next call reconnect.
+- **Not transactional.** A write happens at once and stays even if the
+  transaction rolls back.
+- **Never stuck on an outage.** Calls time out after `timeout_ms`. When Redis
+  can't be reached, the call warns once and the server is skipped (no waiting)
+  for `retry_interval_ms`, so a bulk update doesn't wait on every row. With the
+  default `on_error 'warning'` a trigger never fails the statement that fired it.
+- Arguments are `STRICT`: a `NULL` key or value makes the call return `NULL`
+  without doing anything.
+- Existing databases get these with `ALTER EXTENSION sc_pglib UPDATE`.
+
 ## How it fits together
 
-- `src/sc_pglib.cpp` is a PostgreSQL loadable module (`sc_pglib.so`, or
-  `sc_pglib.dylib` on macOS) using the version-1 calling convention. It links
-  `sc::sc-core` statically. C++ exceptions never reach PostgreSQL: they become an
-  `ERROR`, raised only after the C++ objects are gone, because `ereport()`
-  `longjmp()`s past destructors.
-- `sql/sc_pglib.control` and `sql/sc_pglib--1.0.sql` are what `CREATE EXTENSION`
-  reads. They and the module install into the server's own directories
+- The module (`sc_pglib.so`, or `sc_pglib.dylib` on macOS) is a PostgreSQL
+  loadable module using the version-1 calling convention: `src/sc_pglib.cpp`
+  (base64) and `src/sc_redis.cpp` (Redis), linking `sc::sc-redis` and
+  `sc::sc-core` statically and hiredis dynamically. `src/pg_glue.h` has the rules
+  for mixing C++ and PostgreSQL: C++ exceptions never reach PostgreSQL, and
+  nothing that can raise a PostgreSQL error runs while a C++ object is alive,
+  because `ereport()` `longjmp()`s past destructors.
+- `sql/sc_pglib.control` and the `sql/sc_pglib--*.sql` scripts are what `CREATE
+  EXTENSION` reads: `sc_pglib--1.0.sql` (base64) and the `1.0--1.1` update
+  (Redis). They and the module install into the server's own directories
   (`pg_config --sharedir`/extension and `--pkglibdir`).
-- The extension version (`1.0`) is separate from the package version. A package
-  update replaces the module in place; adding or changing SQL functions needs a
-  new extension version with an upgrade script (`sc_pglib--1.0--1.1.sql`), after
-  which databases run `ALTER EXTENSION sc_pglib UPDATE`.
+- The extension version (`1.1`) is separate from the package version. A package
+  update replaces the module in place; adding or changing SQL objects needs a new
+  extension version with an update script (`sc_pglib--1.1--1.2.sql`), after which
+  databases run `ALTER EXTENSION sc_pglib UPDATE`.
 
 ## Building
 
@@ -89,6 +155,12 @@ directories belong to Homebrew and `install.sh` installs with `sudo`.
 `test-extension` starts a throwaway PostgreSQL cluster (Unix socket only, in a
 temporary directory) and checks the functions, without installing anything. With
 PostgreSQL 18 or later it loads the extension with a real `CREATE EXTENSION`,
-staged through `extension_control_path`; older servers run the extension script
-directly. It is skipped where it can't run: without the server binaries
-(`initdb`, `pg_ctl`), or as root.
+staged through `extension_control_path`, and also checks updating from 1.0;
+older servers run the extension scripts directly. It is skipped where it can't
+run: without the server binaries (`initdb`, `pg_ctl`), or as root.
+
+The Redis checks always cover option validation, an unreachable server (one
+warning, then fast skips; `on_error 'error'`) and permissions. With
+`SC_REDIS_DEMO_SERVER` set they also run against that Redis, including a trigger,
+and with `SC_REDIS_TEST_PASSWORD` a password-protected server through a user
+mapping (both come from `scripts/test.env` in the suite).

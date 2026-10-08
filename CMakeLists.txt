@@ -20,6 +20,7 @@ message(STATUS "SimplyCPP ${SC_MODULE} Version: ${SC_VERSION}")
 # Dependencies #
 ################
 find_or_install_package(sc-core simply-cpp-dev simply-cpp 1.5.8)
+find_or_install_package(sc-redis simply-cpp-redis-dev simply-cpp-redis 1.1.6)
 
 ## PostgreSQL server ##
 # An extension is built for one PostgreSQL major version. Each Ubuntu release builds for a fixed
@@ -91,9 +92,10 @@ message(STATUS "Building for ${SC_PGLIB_PG_VERSION} (${SC_PGLIB_PG_CONFIG})")
 # A module PostgreSQL loads with dlopen(), so no "lib" prefix and no link against the server:
 # its symbols resolve at load time. macOS needs that said explicitly, and PostgreSQL 16 and
 # later look for ".dylib" there.
-add_library(sc_pglib MODULE src/sc_pglib.cpp)
+add_library(sc_pglib MODULE src/sc_pglib.cpp src/sc_redis.cpp)
 target_include_directories(sc_pglib PRIVATE "${SC_PGLIB_PG_INCLUDEDIR}")
-target_link_libraries(sc_pglib PRIVATE sc::sc-core)
+# sc::sc-redis brings sc::sc-core (base64) with it.
+target_link_libraries(sc_pglib PRIVATE sc::sc-redis)
 set_target_properties(sc_pglib PROPERTIES PREFIX "")
 if (APPLE)
     target_link_options(sc_pglib PRIVATE -undefined dynamic_lookup)
@@ -102,7 +104,7 @@ if (APPLE)
     endif ()
 endif ()
 
-set(SC_PGLIB_EXTENSION_FILES sql/sc_pglib.control sql/sc_pglib--1.0.sql)
+set(SC_PGLIB_EXTENSION_FILES sql/sc_pglib.control sql/sc_pglib--1.0.sql sql/sc_pglib--1.0--1.1.sql)
 if (SC_PGLIB_INSTALL)
     install(TARGETS sc_pglib LIBRARY DESTINATION "${SC_PGLIB_PG_PKGLIBDIR}" COMPONENT runtime)
     install(FILES ${SC_PGLIB_EXTENSION_FILES} DESTINATION "${SC_PGLIB_PG_SHAREDIR}/extension" COMPONENT runtime)
