@@ -17,10 +17,12 @@ The apt package is built for each Ubuntu release's own PostgreSQL:
 |---|---|---|
 | noble (24.04) | 16 | `postgresql-16` |
 | resolute (26.04) | 18 | `postgresql-18` |
-| jammy (22.04) | not built | Ubuntu's PostgreSQL server headers aren't available on the build server |
+| jammy (22.04) | 16, from PGDG | `postgresql-16` (from [PGDG](https://apt.postgresql.org)) |
 
-A server running another PostgreSQL version (for example from the PGDG
-repository) needs a build against that version; see Building.
+jammy is the exception: Ubuntu's own PostgreSQL there is 14, but the jammy
+package targets PostgreSQL 16 from the PGDG repository, which is what our jammy
+database servers run. A server with another PostgreSQL version needs a build
+against that version; see Building.
 
 This first version is a proof of concept wrapping `sc::base64`:
 
@@ -51,11 +53,13 @@ All are `IMMUTABLE STRICT PARALLEL SAFE`: a `NULL` argument gives `NULL`.
 ## Building
 
 An extension is built for one PostgreSQL major version: the one whose *server*
-`pg_config` is used. By default that's the newest one found in
-`/usr/lib/postgresql/*/bin` (from `postgresql-server-dev-<version>`) or Homebrew's
-`postgresql@<version>`; on Linux, `postgresql-server-dev-all` is installed when
-none is. Pick another with `-DSC_PGLIB_PG_CONFIG=/path/to/pg_config`. The `.deb`
-depends on `postgresql-<version>` to match.
+`pg_config` is used. On Ubuntu that's fixed per release (`SC_PGLIB_PG_MAJOR`,
+see the table above), and `postgresql-server-dev-<version>` is installed if it's
+missing; jammy's build server has the PGDG repository for it, pinned so it never
+upgrades Ubuntu packages on its own. Elsewhere (macOS) it's the newest server
+found, such as Homebrew's `postgresql@<version>`. Pick another with
+`-DSC_PGLIB_PG_MAJOR=<version>` or `-DSC_PGLIB_PG_CONFIG=/path/to/pg_config`. The
+`.deb` depends on `postgresql-<version>` to match.
 
 On macOS, installing is off by default (`SC_PGLIB_INSTALL`), since the server's
 directories belong to Homebrew and `install.sh` installs with `sudo`.
