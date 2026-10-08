@@ -22,22 +22,47 @@ message(STATUS "SimplyCPP ${SC_MODULE} Version: ${SC_VERSION}")
 find_or_install_package(sc-core simply-cpp-dev simply-cpp 1.5.8)
 
 ## PostgreSQL server ##
-# An extension is built for one PostgreSQL major version: the one whose server pg_config this
-# uses. That is the newest one installed unless SC_PGLIB_PG_CONFIG names another. (The pg_config
-# in /usr/bin or Homebrew's libpq is the client's and has no server headers.)
+# An extension is built for one PostgreSQL major version. Each Ubuntu release builds for a fixed
+# one, so its package always matches: the release's own PostgreSQL (noble 16, resolute 18),
+# except jammy, which builds for PostgreSQL 16 from PGDG (apt.postgresql.org), as devdb runs.
+# Elsewhere (macOS) it's the newest server installed. SC_PGLIB_PG_MAJOR or SC_PGLIB_PG_CONFIG
+# choose another. (The pg_config in /usr/bin or Homebrew's libpq is the client's, without
+# server headers.)
+if (NOT APPLE AND NOT DEFINED CACHE{SC_PGLIB_PG_MAJOR})
+    execute_process(COMMAND lsb_release -cs
+            OUTPUT_VARIABLE sc_pglib_codename OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if (sc_pglib_codename STREQUAL "jammy" OR sc_pglib_codename STREQUAL "noble")
+        set(sc_pglib_release_major 16)
+    elseif (sc_pglib_codename STREQUAL "resolute")
+        set(sc_pglib_release_major 18)
+    endif ()
+endif ()
+set(SC_PGLIB_PG_MAJOR "${sc_pglib_release_major}" CACHE STRING
+        "PostgreSQL major version to build for (empty: the newest installed)")
+
 if (NOT SC_PGLIB_PG_CONFIG)
-    file(GLOB sc_pglib_candidates
-            /usr/lib/postgresql/*/bin/pg_config
-            /opt/homebrew/opt/postgresql@*/bin/pg_config
-            /usr/local/opt/postgresql@*/bin/pg_config)
+    if (SC_PGLIB_PG_MAJOR)
+        set(sc_pglib_version_glob "${SC_PGLIB_PG_MAJOR}")
+        set(sc_pglib_server_dev "postgresql-server-dev-${SC_PGLIB_PG_MAJOR}")
+    else ()
+        set(sc_pglib_version_glob "*")
+        set(sc_pglib_server_dev "postgresql-server-dev-all")
+    endif ()
+    set(sc_pglib_globs
+            /usr/lib/postgresql/${sc_pglib_version_glob}/bin/pg_config
+            /opt/homebrew/opt/postgresql@${sc_pglib_version_glob}/bin/pg_config
+            /usr/local/opt/postgresql@${sc_pglib_version_glob}/bin/pg_config)
+    file(GLOB sc_pglib_candidates ${sc_pglib_globs})
     if (NOT sc_pglib_candidates AND NOT APPLE)
-        message(STATUS "No PostgreSQL server headers found, installing postgresql-server-dev-all")
-        execute_process(COMMAND sudo apt-get install -y postgresql-server-dev-all)
-        file(GLOB sc_pglib_candidates /usr/lib/postgresql/*/bin/pg_config)
+        message(STATUS "No PostgreSQL ${SC_PGLIB_PG_MAJOR} server headers found, installing ${sc_pglib_server_dev}")
+        execute_process(COMMAND sudo apt-get install -y ${sc_pglib_server_dev})
+        file(GLOB sc_pglib_candidates ${sc_pglib_globs})
     endif ()
     if (NOT sc_pglib_candidates)
-        message(FATAL_ERROR "No PostgreSQL server pg_config found. Install postgresql-server-dev-<version>"
-                " (apt) or postgresql@<version> (brew), or pass -DSC_PGLIB_PG_CONFIG=/path/to/pg_config")
+        message(FATAL_ERROR "No PostgreSQL ${SC_PGLIB_PG_MAJOR} server pg_config found. Install"
+                " ${sc_pglib_server_dev} (apt; on jammy PostgreSQL 16 comes from the PGDG repository,"
+                " apt.postgresql.org) or postgresql@<version> (brew), or pass"
+                " -DSC_PGLIB_PG_CONFIG=/path/to/pg_config")
     endif ()
     list(SORT sc_pglib_candidates COMPARE NATURAL ORDER DESCENDING)
     list(GET sc_pglib_candidates 0 sc_pglib_newest)
