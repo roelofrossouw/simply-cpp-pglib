@@ -1,0 +1,5 @@
+# sc_pglib: simply-cpp functions for PostgreSQL
+comment = 'simply-cpp functions (base64)'
+default_version = '1.0'
+module_pathname = '$libdir/sc_pglib'
+relocatable = true
