@@ -60,7 +60,7 @@ if [ "$major" -ge 18 ]; then
     check_extension=1
 else
     echo "PostgreSQL $major: running the extension scripts directly (CREATE EXTENSION of an uninstalled extension needs 18)"
-    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql; do
+    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql; do
         sed -e '/^\\echo/d' -e "s|MODULE_PATHNAME|$library|g" "$sql_dir/$step" | psql_run
     done
     check_extension=0
@@ -169,6 +169,28 @@ SQL
     expect "Redis hmget/hgetall as jsonb" \
         't t t {"name": "simply-cpp", "missing": null} {"odd": "say \"hi\"\nnext", "kind": "demo", "name": "simply-cpp"} t {} {}' \
         "$(tr '\n' ' ' <<<"$output" | sed 's/ $//')"
+    output=$(session -v prefix="$prefix" <<'SQL'
+select sc_redis_sadd('cache', :'prefix' || ':set', 'red');
+select sc_redis_sadd('cache', :'prefix' || ':set', array['green', 'blue', 'red']);
+select sc_redis_sadd('cache', :'prefix' || ':set', array[]::text[]);
+select sc_redis_scard('cache', :'prefix' || ':set');
+select sc_redis_smembers('cache', :'prefix' || ':set');
+select sc_redis_sismember('cache', :'prefix' || ':set', 'green');
+select sc_redis_sismember('cache', :'prefix' || ':set', 'purple');
+select 'red' = any(sc_redis_smembers('cache', :'prefix' || ':set'));
+select sc_redis_srem('cache', :'prefix' || ':set', array['green', 'purple']);
+select sc_redis_srem('cache', :'prefix' || ':set', 'blue');
+select sc_redis_smembers('cache', :'prefix' || ':set');
+select sc_redis_scard('cache', :'prefix' || ':no-such-set');
+select sc_redis_smembers('cache', :'prefix' || ':no-such-set');
+select sc_redis_sismember('cache', :'prefix' || ':no-such-set', 'red');
+select sc_redis_del('cache', :'prefix' || ':set');
+SQL
+    )
+    expect "Redis sets: sadd/srem (one or several), scard, smembers, sismember" \
+        '1 2 0 3 {blue,green,red} t f t 1 1 {red} 0 {} f 1' \
+        "$(tr '\n' ' ' <<<"$output" | sed 's/ $//')"
+    check "~members must not contain NULL" "select sc_redis_sadd('cache', 'key', array['a', null])"
     expect "a Redis error reply (WRONGTYPE) is a warning" "~WRONGTYPE" \
         "$(session -v prefix="$prefix" <<<"select sc_redis_get('cache', :'prefix' || ':hash');")"
 
@@ -221,16 +243,17 @@ else
 fi
 
 if [ "$check_extension" = 1 ]; then
-    check "sc_pglib|1.2" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.3" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "" "set client_min_messages = warning; drop extension sc_pglib cascade"
     check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%')"
     # Updating from 1.0, as an existing database does.
     check "" "create extension sc_pglib version '1.0'"
     check "f" "select exists (select 1 from pg_proc where proname = 'sc_redis_get')"
     check "" "alter extension sc_pglib update"
-    check "sc_pglib|1.2" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.3" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_redis')"
     check "t" "select exists (select 1 from pg_proc where proname = 'sc_redis_hgetall')"
+    check "2" "select count(*) from pg_proc where proname = 'sc_redis_sadd'"
 fi
 
 if [ "$failures" -ne 0 ]; then
