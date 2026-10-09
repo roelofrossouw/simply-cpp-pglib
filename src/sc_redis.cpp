@@ -48,6 +48,13 @@ PG_FUNCTION_INFO_V1(sc_redis_hset);
 PG_FUNCTION_INFO_V1(sc_redis_hget);
 PG_FUNCTION_INFO_V1(sc_redis_hmget);
 PG_FUNCTION_INFO_V1(sc_redis_hgetall);
+PG_FUNCTION_INFO_V1(sc_redis_sadd);
+PG_FUNCTION_INFO_V1(sc_redis_sadd_many);
+PG_FUNCTION_INFO_V1(sc_redis_srem);
+PG_FUNCTION_INFO_V1(sc_redis_srem_many);
+PG_FUNCTION_INFO_V1(sc_redis_scard);
+PG_FUNCTION_INFO_V1(sc_redis_smembers);
+PG_FUNCTION_INFO_V1(sc_redis_sismember);
 }
 
 namespace {
@@ -177,6 +184,8 @@ namespace {
         long long count = 0;
         struct varlena *value = nullptr;
         char *json = nullptr; // hmget/hgetall: JSON text for jsonb_in
+        Datum *items = nullptr; // smembers: text values for a text[]
+        int item_count = 0;
         sc_pglib::pending_error error;
     };
 
@@ -229,6 +238,13 @@ namespace {
             }
         }
         json += '"';
+    }
+
+    std::vector<std::string> strings_from(const text_list &list) {
+        std::vector<std::string> strings;
+        strings.reserve(static_cast<std::size_t>(list.count));
+        for (int i = 0; i < list.count; ++i) strings.emplace_back(list.data[i], static_cast<std::size_t>(list.lengths[i]));
+        return strings;
     }
 
     // Runs command (sc::redis &, outcome &) on s's client, connecting first if needed.
@@ -403,9 +419,7 @@ extern "C" Datum sc_redis_hmget(PG_FUNCTION_ARGS) {
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
     const text_list fields = texts_from(PG_GETARG_ARRAYTYPE_P(2), "fields");
     const outcome result = run(s, [key, fields](sc::redis &redis, outcome &out) {
-        std::vector<std::string> names;
-        names.reserve(static_cast<std::size_t>(fields.count));
-        for (int i = 0; i < fields.count; ++i) names.emplace_back(fields.data[i], static_cast<std::size_t>(fields.lengths[i]));
+        const auto names = strings_from(fields);
         const auto values = redis.hmget(std::string{key}, names);
         std::string json = "{";
         for (std::size_t i = 0; i < names.size() && i < values.size(); ++i) {
@@ -444,4 +458,112 @@ extern "C" Datum sc_redis_hgetall(PG_FUNCTION_ARGS) {
     result.error.raise();
     if (!result.done || !result.json) PG_RETURN_NULL();
     PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(result.json)));
+}
+
+namespace {
+    // A bigint count, or NULL when the call failed.
+    Datum count_result(const outcome &result, FunctionCallInfo fcinfo) {
+        result.error.raise();
+        if (!result.done) PG_RETURN_NULL();
+        PG_RETURN_INT64(result.count);
+    }
+}
+
+// sc_redis_sadd(server, key, member) -> bigint: members added (0 when it was there already),
+// or NULL when it failed
+extern "C" Datum sc_redis_sadd(PG_FUNCTION_ARGS) {
+    const settings s = settings_for(PG_GETARG_TEXT_PP(0));
+    const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
+    const std::string_view member = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(2));
+    return count_result(run(s, [key, member](sc::redis &redis, outcome &out) {
+        out.count = static_cast<long long>(redis.sadd(std::string{key}, std::string{member}));
+    }), fcinfo);
+}
+
+// sc_redis_sadd(server, key, members text[]) -> bigint: members added, or NULL when it failed
+extern "C" Datum sc_redis_sadd_many(PG_FUNCTION_ARGS) {
+    const settings s = settings_for(PG_GETARG_TEXT_PP(0));
+    const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
+    const text_list members = texts_from(PG_GETARG_ARRAYTYPE_P(2), "members");
+    return count_result(run(s, [key, members](sc::redis &redis, outcome &out) {
+        out.count = static_cast<long long>(redis.sadd(std::string{key}, strings_from(members)));
+    }), fcinfo);
+}
+
+// sc_redis_srem(server, key, member) -> bigint: members removed (0 when it wasn't there), or NULL
+// when it failed
+extern "C" Datum sc_redis_srem(PG_FUNCTION_ARGS) {
+    const settings s = settings_for(PG_GETARG_TEXT_PP(0));
+    const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
+    const std::string_view member = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(2));
+    return count_result(run(s, [key, member](sc::redis &redis, outcome &out) {
+        out.count = static_cast<long long>(redis.srem(std::string{key}, std::string{member}));
+    }), fcinfo);
+}
+
+// sc_redis_srem(server, key, members text[]) -> bigint: members removed, or NULL when it failed
+extern "C" Datum sc_redis_srem_many(PG_FUNCTION_ARGS) {
+    const settings s = settings_for(PG_GETARG_TEXT_PP(0));
+    const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
+    const text_list members = texts_from(PG_GETARG_ARRAYTYPE_P(2), "members");
+    return count_result(run(s, [key, members](sc::redis &redis, outcome &out) {
+        out.count = static_cast<long long>(redis.srem(std::string{key}, strings_from(members)));
+    }), fcinfo);
+}
+
+// sc_redis_scard(server, key) -> bigint: the set's size (0 when there's no such key), or NULL
+// when it failed
+extern "C" Datum sc_redis_scard(PG_FUNCTION_ARGS) {
+    const settings s = settings_for(PG_GETARG_TEXT_PP(0));
+    const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
+    return count_result(run(s, [key](sc::redis &redis, outcome &out) {
+        out.count = static_cast<long long>(redis.scard(std::string{key}));
+    }), fcinfo);
+}
+
+// sc_redis_smembers(server, key) -> text[]: the members, sorted ({} when there's no such key),
+// or NULL when it failed
+extern "C" Datum sc_redis_smembers(PG_FUNCTION_ARGS) {
+    const settings s = settings_for(PG_GETARG_TEXT_PP(0));
+    const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
+    const outcome result = run(s, [key](sc::redis &redis, outcome &out) {
+        const auto members = redis.smembers(std::string{key});
+        if (members.empty()) return;
+        const Size size = sizeof(Datum) * members.size();
+        if (!AllocSizeIsValid(size)) {
+            out.error.set(ERRCODE_PROGRAM_LIMIT_EXCEEDED, ERROR, "too many set members");
+            return;
+        }
+        auto *items = static_cast<Datum *>(MemoryContextAllocExtended(CurrentMemoryContext, size, MCXT_ALLOC_NO_OOM));
+        if (!items) {
+            out.error.set(ERRCODE_OUT_OF_MEMORY, ERROR, "out of memory");
+            return;
+        }
+        int count = 0;
+        for (const auto &member: members) {
+            struct varlena *value = sc_pglib::new_varlena(member, out.error);
+            if (!value) return;
+            items[count++] = PointerGetDatum(value);
+        }
+        out.items = items;
+        out.item_count = count;
+    });
+    result.error.raise();
+    if (!result.done) PG_RETURN_NULL();
+    if (result.item_count == 0) PG_RETURN_ARRAYTYPE_P(construct_empty_array(TEXTOID));
+    PG_RETURN_ARRAYTYPE_P(construct_array(result.items, result.item_count, TEXTOID, -1, false, TYPALIGN_INT));
+}
+
+// sc_redis_sismember(server, key, member) -> boolean: whether member is in the set, or NULL when
+// it failed
+extern "C" Datum sc_redis_sismember(PG_FUNCTION_ARGS) {
+    const settings s = settings_for(PG_GETARG_TEXT_PP(0));
+    const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
+    const std::string_view member = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(2));
+    const outcome result = run(s, [key, member](sc::redis &redis, outcome &out) {
+        out.found = redis.sismember(std::string{key}, std::string{member});
+    });
+    result.error.raise();
+    if (!result.done) PG_RETURN_NULL();
+    PG_RETURN_BOOL(result.found);
 }

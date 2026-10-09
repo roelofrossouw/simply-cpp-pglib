@@ -86,10 +86,17 @@ GRANT USAGE ON FOREIGN SERVER cache TO app;
 | `sc_redis_hget(server, key, field)` | `text`, `NULL` when there's no such field |
 | `sc_redis_hmget(server, key, fields text[])` | `jsonb`: `{"field": "value", ...}` for the requested fields, `null` for missing ones |
 | `sc_redis_hgetall(server, key)` | `jsonb`: every field of the hash, `{}` when there's no such key |
+| `sc_redis_sadd(server, key, member)`, `sc_redis_sadd(server, key, members text[])` | `bigint`: members added (not counting ones already there) |
+| `sc_redis_srem(server, key, member)`, `sc_redis_srem(server, key, members text[])` | `bigint`: members removed |
+| `sc_redis_scard(server, key)` | `bigint`: members in the set, `0` when there's no such key |
+| `sc_redis_smembers(server, key)` | `text[]`: the members, sorted; `{}` when there's no such key |
+| `sc_redis_sismember(server, key, member)` | `boolean`: whether it's a member |
 
 ```sql
 SELECT sc_redis_hmget('cache', 'vehicle:1', array['name', 'colour']);  -- {"name": "first", "colour": null}
 SELECT sc_redis_hgetall('cache', 'vehicle:1') ->> 'name';                 -- first
+SELECT sc_redis_sadd('cache', 'online', array['vehicle:1', 'vehicle:2']);    -- 2
+SELECT 'vehicle:1' = ANY(sc_redis_smembers('cache', 'online'));              -- true
 ```
 
 A trigger keeping a hash per row up to date:
@@ -136,11 +143,11 @@ How it behaves:
   because `ereport()` `longjmp()`s past destructors.
 - `sql/sc_pglib.control` and the `sql/sc_pglib--*.sql` scripts are what `CREATE
   EXTENSION` reads: `sc_pglib--1.0.sql` (base64) and the updates `1.0--1.1`
-  (Redis) and `1.1--1.2` (`hmget`, `hgetall`). They and the module install into the server's own directories
+  (Redis), `1.1--1.2` (`hmget`, `hgetall`) and `1.2--1.3` (sets). They and the module install into the server's own directories
   (`pg_config --sharedir`/extension and `--pkglibdir`).
-- The extension version (`1.2`) is separate from the package version. A package
+- The extension version (`1.3`) is separate from the package version. A package
   update replaces the module in place; adding or changing SQL objects needs a new
-  extension version with an update script (`sc_pglib--1.2--1.3.sql`), after which
+  extension version with an update script (`sc_pglib--1.3--1.4.sql`), after which
   databases run `ALTER EXTENSION sc_pglib UPDATE`.
 
 ## Building
