@@ -19,8 +19,8 @@ message(STATUS "SimplyCPP ${SC_MODULE} Version: ${SC_VERSION}")
 ################
 # Dependencies #
 ################
-find_or_install_package(sc-core simply-cpp-dev simply-cpp 1.5.8)
-find_or_install_package(sc-redis simply-cpp-redis-dev simply-cpp-redis 1.1.11) # sets: 1.1.11
+find_or_install_package(sc-core simply-cpp-dev simply-cpp 1.5.21)
+find_or_install_package(sc-redis simply-cpp-redis-dev simply-cpp-redis 1.1.12)
 
 ## PostgreSQL server ##
 # An extension is built for one PostgreSQL major version. Each Ubuntu release builds for a fixed
