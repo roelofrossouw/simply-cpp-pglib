@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 set(SC_MODULE pglib)
-project(simply-cpp-${SC_MODULE} LANGUAGES CXX)
+project(simply-cpp-${SC_MODULE} HOMEPAGE_URL "https://github.com/roelofrossouw/simply-cpp-pglib" LANGUAGES CXX)
 include(cmake/sc_bootstrap.cmake)
 
 # Options:
@@ -19,7 +19,7 @@ message(STATUS "SimplyCPP ${SC_MODULE} Version: ${SC_VERSION}")
 ################
 # Dependencies #
 ################
-find_or_install_package(sc-core simply-cpp-dev simply-cpp 1.5.21)
+find_or_install_package(sc-core simply-cpp-dev simply-cpp 1.7.0)
 find_or_install_package(sc-redis simply-cpp-redis-dev simply-cpp-redis 1.1.12)
 
 ## PostgreSQL server ##
