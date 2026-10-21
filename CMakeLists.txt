@@ -19,7 +19,7 @@ message(STATUS "SimplyCPP ${SC_MODULE} Version: ${SC_VERSION}")
 ################
 # Dependencies #
 ################
-find_or_install_package(sc-core simply-cpp-dev simply-cpp 1.7.0)
+find_or_install_package(sc-core simply-cpp-dev simply-cpp 1.20.0)
 find_or_install_package(sc-redis simply-cpp-redis-dev simply-cpp-redis 1.1.12)
 
 ## PostgreSQL server ##
