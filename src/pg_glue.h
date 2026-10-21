@@ -56,38 +56,33 @@ namespace sc_pglib {
         }
     };
 
-    // A new text or bytea (the same layout) holding bytes, or nullptr with error set when it is
-    // too large or memory runs out. Never raises.
-    inline struct varlena *new_varlena(const std::string_view bytes, pending_error &error) {
-        const Size size = VARHDRSZ + bytes.size();
+    // size bytes from the current memory context, or nullptr with error set when size is too
+    // large or memory runs out. Never raises.
+    inline void *alloc_no_oom(const Size size, pending_error &error) {
         if (!AllocSizeIsValid(size)) {
             error.set(ERRCODE_PROGRAM_LIMIT_EXCEEDED, ERROR, "result exceeds the maximum value size");
             return nullptr;
         }
-        auto *result = static_cast<struct varlena *>(
-            MemoryContextAllocExtended(CurrentMemoryContext, size, MCXT_ALLOC_NO_OOM));
-        if (!result) {
-            error.set(ERRCODE_OUT_OF_MEMORY, ERROR, "out of memory");
-            return nullptr;
-        }
+        void *result = MemoryContextAllocExtended(CurrentMemoryContext, size, MCXT_ALLOC_NO_OOM);
+        if (!result) error.set(ERRCODE_OUT_OF_MEMORY, ERROR, "out of memory");
+        return result;
+    }
+
+    // A new text or bytea (the same layout) holding bytes, or nullptr with error set. Never raises.
+    inline struct varlena *new_varlena(const std::string_view bytes, pending_error &error) {
+        const Size size = VARHDRSZ + bytes.size();
+        auto *result = static_cast<struct varlena *>(alloc_no_oom(size, error));
+        if (!result) return nullptr;
         SET_VARSIZE(result, size);
         std::memcpy(VARDATA(result), bytes.data(), bytes.size());
         return result;
     }
 
     // A new NUL-terminated copy of bytes (for PostgreSQL input functions such as jsonb_in), or
-    // nullptr with error set when memory runs out. Never raises.
+    // nullptr with error set. Never raises.
     inline char *new_cstring(const std::string_view bytes, pending_error &error) {
-        if (!AllocSizeIsValid(bytes.size() + 1)) {
-            error.set(ERRCODE_PROGRAM_LIMIT_EXCEEDED, ERROR, "result exceeds the maximum value size");
-            return nullptr;
-        }
-        auto *result = static_cast<char *>(
-            MemoryContextAllocExtended(CurrentMemoryContext, bytes.size() + 1, MCXT_ALLOC_NO_OOM));
-        if (!result) {
-            error.set(ERRCODE_OUT_OF_MEMORY, ERROR, "out of memory");
-            return nullptr;
-        }
+        auto *result = static_cast<char *>(alloc_no_oom(bytes.size() + 1, error));
+        if (!result) return nullptr;
         std::memcpy(result, bytes.data(), bytes.size());
         result[bytes.size()] = '\0';
         return result;
