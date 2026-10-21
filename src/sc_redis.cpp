@@ -72,13 +72,6 @@ namespace {
         bool raise_errors = false;
     };
 
-    bool is_server_option(const char *name) {
-        for (const char *known: {"servers", "connect_timeout_ms", "timeout_ms", "retry_interval_ms", "on_error"}) {
-            if (std::strcmp(name, known) == 0) return true;
-        }
-        return false;
-    }
-
     // A whole number of milliseconds from minimum to an hour, or -1.
     int milliseconds(const char *text, const int minimum) {
         char *end = nullptr;
@@ -88,7 +81,9 @@ namespace {
         return static_cast<int>(value);
     }
 
-    // Applies one server option to s; returns a problem with its value, or nullptr.
+    constexpr const char *unknown_option = "unknown option";
+
+    // Applies one server option to s; returns unknown_option, a problem with its value, or nullptr.
     const char *apply_server_option(settings &s, const char *name, const char *value) {
         if (std::strcmp(name, "servers") == 0) {
             s.servers = value;
@@ -102,6 +97,8 @@ namespace {
             if (std::strcmp(value, "warning") == 0) s.raise_errors = false;
             else if (std::strcmp(value, "error") == 0) s.raise_errors = true;
             else return "on_error must be 'warning' or 'error'";
+        } else {
+            return unknown_option;
         }
         return nullptr;
     }
@@ -180,7 +177,7 @@ namespace {
     // How a call went, as plain data that outlives the call's C++ objects.
     struct outcome {
         bool done = false;  // the command ran
-        bool found = false; // get/hget: there was a value
+        bool found = false; // sismember
         long long count = 0;
         struct varlena *value = nullptr;
         char *json = nullptr; // hmget/hgetall: JSON text for jsonb_in
@@ -240,6 +237,22 @@ namespace {
         json += '"';
     }
 
+    using json_pairs = std::vector<std::pair<std::string_view, std::optional<std::string_view>>>;
+
+    // A JSON object of (name, value) pairs; a missing value becomes null.
+    std::string json_object(const json_pairs &pairs) {
+        std::string json = "{";
+        for (const auto &[name, value]: pairs) {
+            if (json.size() > 1) json += ", ";
+            append_json_string(json, name);
+            json += ": ";
+            if (value) append_json_string(json, *value);
+            else json += "null";
+        }
+        json += '}';
+        return json;
+    }
+
     std::vector<std::string> strings_from(const text_list &list) {
         std::vector<std::string> strings;
         strings.reserve(static_cast<std::size_t>(list.count));
@@ -294,6 +307,26 @@ namespace {
         }
         return result;
     }
+
+    // The result helpers raise result's error, so call them with no C++ object alive (an
+    // outcome is plain data).
+    Datum count_result(const outcome &result, FunctionCallInfo fcinfo) {
+        result.error.raise();
+        if (!result.done) PG_RETURN_NULL();
+        PG_RETURN_INT64(result.count);
+    }
+
+    Datum text_result(const outcome &result, FunctionCallInfo fcinfo) {
+        result.error.raise();
+        if (!result.value) PG_RETURN_NULL();
+        PG_RETURN_TEXT_P(result.value);
+    }
+
+    Datum jsonb_result(const outcome &result, FunctionCallInfo fcinfo) {
+        result.error.raise();
+        if (!result.done || !result.json) PG_RETURN_NULL();
+        PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(result.json)));
+    }
 }
 
 // sc_redis_validator(text[], oid): checks options as they are set on the sc_redis wrapper's
@@ -309,13 +342,14 @@ extern "C" Datum sc_redis_validator(PG_FUNCTION_ARGS) {
         auto *option = static_cast<DefElem *>(lfirst(cell));
         const char *value = defGetString(option);
         if (catalog == ForeignServerRelationId) {
-            if (!is_server_option(option->defname)) {
+            const char *problem = apply_server_option(s, option->defname, value);
+            if (problem == unknown_option) {
                 ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
                                 errmsg("invalid option \"%s\" for a %s server", option->defname, wrapper_name),
                                 errhint("Valid options are servers, connect_timeout_ms, timeout_ms, "
                                         "retry_interval_ms and on_error.")));
             }
-            if (const char *problem = apply_server_option(s, option->defname, value)) {
+            if (problem) {
                 ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_ATTRIBUTE_VALUE), errmsg("%s", problem)));
             }
             if (std::strcmp(option->defname, "servers") == 0) {
@@ -360,27 +394,18 @@ extern "C" Datum sc_redis_set(PG_FUNCTION_ARGS) {
 extern "C" Datum sc_redis_get(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
-    const outcome result = run(s, [key](sc::redis &redis, outcome &out) {
-        if (const auto value = redis.get(std::string{key})) {
-            out.found = true;
-            out.value = sc_pglib::new_varlena(*value, out.error);
-        }
-    });
-    result.error.raise();
-    if (!result.found || !result.value) PG_RETURN_NULL();
-    PG_RETURN_TEXT_P(result.value);
+    return text_result(run(s, [key](sc::redis &redis, outcome &out) {
+        if (const auto value = redis.get(std::string{key})) out.value = sc_pglib::new_varlena(*value, out.error);
+    }), fcinfo);
 }
 
 // sc_redis_del(server, key) -> bigint: keys removed (0 or 1), or NULL when it failed
 extern "C" Datum sc_redis_del(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
-    const outcome result = run(s, [key](sc::redis &redis, outcome &out) {
+    return count_result(run(s, [key](sc::redis &redis, outcome &out) {
         out.count = static_cast<long long>(redis.erase(std::string{key}));
-    });
-    result.error.raise();
-    if (!result.done) PG_RETURN_NULL();
-    PG_RETURN_INT64(result.count);
+    }), fcinfo);
 }
 
 // sc_redis_hset(server, key, field, value) -> boolean: whether it was stored
@@ -401,15 +426,11 @@ extern "C" Datum sc_redis_hget(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
     const std::string_view field = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(2));
-    const outcome result = run(s, [key, field](sc::redis &redis, outcome &out) {
+    return text_result(run(s, [key, field](sc::redis &redis, outcome &out) {
         if (const auto value = redis.hget(std::string{key}, std::string{field})) {
-            out.found = true;
             out.value = sc_pglib::new_varlena(*value, out.error);
         }
-    });
-    result.error.raise();
-    if (!result.found || !result.value) PG_RETURN_NULL();
-    PG_RETURN_TEXT_P(result.value);
+    }), fcinfo);
 }
 
 // sc_redis_hmget(server, key, fields text[]) -> jsonb: {"field": "value" or null, ...} for the
@@ -418,23 +439,15 @@ extern "C" Datum sc_redis_hmget(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
     const text_list fields = texts_from(PG_GETARG_ARRAYTYPE_P(2), "fields");
-    const outcome result = run(s, [key, fields](sc::redis &redis, outcome &out) {
+    return jsonb_result(run(s, [key, fields](sc::redis &redis, outcome &out) {
         const auto names = strings_from(fields);
         const auto values = redis.hmget(std::string{key}, names);
-        std::string json = "{";
+        json_pairs pairs;
         for (std::size_t i = 0; i < names.size() && i < values.size(); ++i) {
-            if (i) json += ", ";
-            append_json_string(json, names[i]);
-            json += ": ";
-            if (values[i]) append_json_string(json, *values[i]);
-            else json += "null";
+            pairs.emplace_back(names[i], values[i] ? std::optional<std::string_view>{*values[i]} : std::nullopt);
         }
-        json += '}';
-        out.json = sc_pglib::new_cstring(json, out.error);
-    });
-    result.error.raise();
-    if (!result.done || !result.json) PG_RETURN_NULL();
-    PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(result.json)));
+        out.json = sc_pglib::new_cstring(json_object(pairs), out.error);
+    }), fcinfo);
 }
 
 // sc_redis_hgetall(server, key) -> jsonb: every field of the hash ({} when there's no such key),
@@ -442,31 +455,12 @@ extern "C" Datum sc_redis_hmget(PG_FUNCTION_ARGS) {
 extern "C" Datum sc_redis_hgetall(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
-    const outcome result = run(s, [key](sc::redis &redis, outcome &out) {
-        std::string json = "{";
-        bool first = true;
-        for (const auto &[field, value]: redis.hgetall(std::string{key})) {
-            if (!first) json += ", ";
-            first = false;
-            append_json_string(json, field);
-            json += ": ";
-            append_json_string(json, value);
-        }
-        json += '}';
-        out.json = sc_pglib::new_cstring(json, out.error);
-    });
-    result.error.raise();
-    if (!result.done || !result.json) PG_RETURN_NULL();
-    PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(result.json)));
-}
-
-namespace {
-    // A bigint count, or NULL when the call failed.
-    Datum count_result(const outcome &result, FunctionCallInfo fcinfo) {
-        result.error.raise();
-        if (!result.done) PG_RETURN_NULL();
-        PG_RETURN_INT64(result.count);
-    }
+    return jsonb_result(run(s, [key](sc::redis &redis, outcome &out) {
+        const auto hash = redis.hgetall(std::string{key});
+        json_pairs pairs;
+        for (const auto &[field, value]: hash) pairs.emplace_back(field, value);
+        out.json = sc_pglib::new_cstring(json_object(pairs), out.error);
+    }), fcinfo);
 }
 
 // sc_redis_sadd(server, key, member) -> bigint: members added (0 when it was there already),
@@ -529,16 +523,8 @@ extern "C" Datum sc_redis_smembers(PG_FUNCTION_ARGS) {
     const outcome result = run(s, [key](sc::redis &redis, outcome &out) {
         const auto members = redis.smembers(std::string{key});
         if (members.empty()) return;
-        const Size size = sizeof(Datum) * members.size();
-        if (!AllocSizeIsValid(size)) {
-            out.error.set(ERRCODE_PROGRAM_LIMIT_EXCEEDED, ERROR, "too many set members");
-            return;
-        }
-        auto *items = static_cast<Datum *>(MemoryContextAllocExtended(CurrentMemoryContext, size, MCXT_ALLOC_NO_OOM));
-        if (!items) {
-            out.error.set(ERRCODE_OUT_OF_MEMORY, ERROR, "out of memory");
-            return;
-        }
+        auto *items = static_cast<Datum *>(sc_pglib::alloc_no_oom(sizeof(Datum) * members.size(), out.error));
+        if (!items) return;
         int count = 0;
         for (const auto &member: members) {
             struct varlena *value = sc_pglib::new_varlena(member, out.error);
