@@ -162,7 +162,6 @@ namespace {
         return s;
     }
 
-    // The session's client for one foreign server.
     struct client_entry {
         std::string signature; // the settings it was made with
         std::unique_ptr<sc::redis> client;
@@ -176,7 +175,7 @@ namespace {
 
     // How a call went, as plain data that outlives the call's C++ objects.
     struct outcome {
-        bool done = false;  // the command ran
+        bool done = false;
         bool found = false; // sismember
         long long count = 0;
         struct varlena *value = nullptr;
@@ -377,7 +376,7 @@ extern "C" Datum sc_redis_validator(PG_FUNCTION_ARGS) {
     PG_RETURN_VOID();
 }
 
-// sc_redis_set(server, key, value) -> boolean: whether it was stored
+// false when it failed
 extern "C" Datum sc_redis_set(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     // Fetched (and detoasted, which may allocate) before the C++ part.
@@ -390,7 +389,7 @@ extern "C" Datum sc_redis_set(PG_FUNCTION_ARGS) {
     PG_RETURN_BOOL(result.done);
 }
 
-// sc_redis_get(server, key) -> text, or NULL when there is no such key (or it failed)
+// NULL when there is no such key, or it failed
 extern "C" Datum sc_redis_get(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
@@ -399,7 +398,7 @@ extern "C" Datum sc_redis_get(PG_FUNCTION_ARGS) {
     }), fcinfo);
 }
 
-// sc_redis_del(server, key) -> bigint: keys removed (0 or 1), or NULL when it failed
+// NULL when it failed
 extern "C" Datum sc_redis_del(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
@@ -408,7 +407,7 @@ extern "C" Datum sc_redis_del(PG_FUNCTION_ARGS) {
     }), fcinfo);
 }
 
-// sc_redis_hset(server, key, field, value) -> boolean: whether it was stored
+// false when it failed
 extern "C" Datum sc_redis_hset(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
@@ -421,7 +420,7 @@ extern "C" Datum sc_redis_hset(PG_FUNCTION_ARGS) {
     PG_RETURN_BOOL(result.done);
 }
 
-// sc_redis_hget(server, key, field) -> text, or NULL when there is no such field (or it failed)
+// NULL when there is no such field, or it failed
 extern "C" Datum sc_redis_hget(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
@@ -433,8 +432,7 @@ extern "C" Datum sc_redis_hget(PG_FUNCTION_ARGS) {
     }), fcinfo);
 }
 
-// sc_redis_hmget(server, key, fields text[]) -> jsonb: {"field": "value" or null, ...} for the
-// requested fields (null where there's no such field), or NULL when it failed
+// {"field": "value" or null where there's no such field, ...}; NULL when it failed
 extern "C" Datum sc_redis_hmget(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
@@ -450,8 +448,7 @@ extern "C" Datum sc_redis_hmget(PG_FUNCTION_ARGS) {
     }), fcinfo);
 }
 
-// sc_redis_hgetall(server, key) -> jsonb: every field of the hash ({} when there's no such key),
-// or NULL when it failed
+// {} when there's no such key; NULL when it failed
 extern "C" Datum sc_redis_hgetall(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
@@ -463,8 +460,7 @@ extern "C" Datum sc_redis_hgetall(PG_FUNCTION_ARGS) {
     }), fcinfo);
 }
 
-// sc_redis_sadd(server, key, member) -> bigint: members added (0 when it was there already),
-// or NULL when it failed
+// 0 when it was there already; NULL when it failed
 extern "C" Datum sc_redis_sadd(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
@@ -474,7 +470,7 @@ extern "C" Datum sc_redis_sadd(PG_FUNCTION_ARGS) {
     }), fcinfo);
 }
 
-// sc_redis_sadd(server, key, members text[]) -> bigint: members added, or NULL when it failed
+// NULL when it failed
 extern "C" Datum sc_redis_sadd_many(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
@@ -484,8 +480,7 @@ extern "C" Datum sc_redis_sadd_many(PG_FUNCTION_ARGS) {
     }), fcinfo);
 }
 
-// sc_redis_srem(server, key, member) -> bigint: members removed (0 when it wasn't there), or NULL
-// when it failed
+// 0 when it wasn't there; NULL when it failed
 extern "C" Datum sc_redis_srem(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
@@ -495,7 +490,7 @@ extern "C" Datum sc_redis_srem(PG_FUNCTION_ARGS) {
     }), fcinfo);
 }
 
-// sc_redis_srem(server, key, members text[]) -> bigint: members removed, or NULL when it failed
+// NULL when it failed
 extern "C" Datum sc_redis_srem_many(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
@@ -505,8 +500,7 @@ extern "C" Datum sc_redis_srem_many(PG_FUNCTION_ARGS) {
     }), fcinfo);
 }
 
-// sc_redis_scard(server, key) -> bigint: the set's size (0 when there's no such key), or NULL
-// when it failed
+// 0 when there's no such key; NULL when it failed
 extern "C" Datum sc_redis_scard(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
@@ -515,8 +509,7 @@ extern "C" Datum sc_redis_scard(PG_FUNCTION_ARGS) {
     }), fcinfo);
 }
 
-// sc_redis_smembers(server, key) -> text[]: the members, sorted ({} when there's no such key),
-// or NULL when it failed
+// Sorted; {} when there's no such key; NULL when it failed
 extern "C" Datum sc_redis_smembers(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
@@ -540,8 +533,7 @@ extern "C" Datum sc_redis_smembers(PG_FUNCTION_ARGS) {
     PG_RETURN_ARRAYTYPE_P(construct_array(result.items, result.item_count, TEXTOID, -1, false, TYPALIGN_INT));
 }
 
-// sc_redis_sismember(server, key, member) -> boolean: whether member is in the set, or NULL when
-// it failed
+// NULL when it failed
 extern "C" Datum sc_redis_sismember(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));

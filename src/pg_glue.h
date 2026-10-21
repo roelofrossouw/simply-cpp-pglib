@@ -25,13 +25,11 @@ extern "C" {
 }
 
 namespace sc_pglib {
-    // The bytes of a text or bytea argument (both are varlenas).
     inline std::string_view varlena_bytes(const struct varlena *value) {
         return {VARDATA_ANY(value), VARSIZE_ANY_EXHDR(value)};
     }
 
-    // An error or warning to report once the C++ objects are gone. Plain data, so it survives
-    // the C++ code that sets it.
+    // Plain data, raised once the C++ objects are gone.
     struct pending_error {
         char message[512] = {};
         int code = ERRCODE_INVALID_PARAMETER_VALUE;
