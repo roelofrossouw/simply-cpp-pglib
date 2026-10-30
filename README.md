@@ -406,6 +406,53 @@ How it behaves:
   without doing anything.
 - Existing databases get these with `ALTER EXTENSION sc_pglib UPDATE`.
 
+## Firebase
+
+`sc_pglib` reads and writes a Firebase Realtime Database through `sc::firebase`,
+signed in with a Google service account, in place of PL/Python and the
+`firebase_admin` package. Settings are a foreign server of the `sc_firebase`
+wrapper, and the service account's key a user mapping:
+
+```sql
+CREATE SERVER app_db FOREIGN DATA WRAPPER sc_firebase
+    OPTIONS (url 'https://example-app.firebaseio.com', root 'devices');
+-- the key as a file the postgres user can read (chmod 640, group postgres) ...
+CREATE USER MAPPING FOR app_role SERVER app_db OPTIONS (credentials_file '/etc/postgresql/firebase.json');
+-- ... or its JSON itself; PostgreSQL shows a mapping's options only to its owner and superusers
+CREATE USER MAPPING FOR app_role SERVER app_db OPTIONS (service_account '{"type": "service_account", ...}');
+GRANT USAGE ON FOREIGN SERVER app_db TO app_role;
+```
+
+| Server option | Default | |
+|---|---|---|
+| `url` | (required) | the database: `https://<name>.firebaseio.com` |
+| `root` | the database's root | the path every call's path is under, so a development database can use another (`testing1`) |
+| `timeout_ms` | `30000` | a request's limit, 1000 to 600000 |
+| `on_error` | `error` | `error`: a failure is an ERROR; `warning`: a WARNING, and the call returns NULL (false) |
+
+| Function | |
+|---|---|
+| `sc_firebase_get(server, path, shallow default false)` | `jsonb`; NULL when there's nothing. `shallow`: a node's children as `true` |
+| `sc_firebase_keys(server, path)` | `text[]`: the child keys, sorted |
+| `sc_firebase_set(server, path, value jsonb)` | `boolean`: replaced what was there |
+| `sc_firebase_update(server, path, values jsonb)` | `boolean`: each member written under path; a member's name may be a path, so several places change at once, all or none; null removes |
+| `sc_firebase_push(server, path, value jsonb)` | `text`: the new child's key |
+| `sc_firebase_remove(server, path)` | `boolean` |
+| `sc_firebase_move(server, from, to, overwrite default false)` | `boolean`: moved in one update, never in both places or neither; false when there's nothing at `from` or `to` is taken |
+
+```sql
+SELECT sc_firebase_set('app_db', '42/350000000000001', '{"lat": -26.2, "lng": 28.0, "online": 1}');
+SELECT sc_firebase_get('app_db', '42/350000000000001');
+SELECT sc_firebase_keys('app_db', '42');
+-- only the devices that changed, in one request
+SELECT sc_firebase_update('app_db', '42', jsonb_build_object('350000000000001/online', 0, 'timestamp', now()));
+SELECT sc_firebase_move('app_db', '42/350000000000001', '43/350000000000001');
+```
+
+Each session keeps one client per server, so its access token (an hour's worth)
+serves every call in that time. Writes aren't transactional: they happen at once
+and stay when the transaction rolls back.
+
 ## How it fits together
 
 - The module (`sc_pglib.so`, or `sc_pglib.dylib` on macOS) is a PostgreSQL

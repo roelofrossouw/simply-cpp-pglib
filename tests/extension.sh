@@ -60,7 +60,7 @@ if [ "$major" -ge 18 ]; then
     check_extension=1
 else
     echo "PostgreSQL $major: running the extension scripts directly (CREATE EXTENSION of an uninstalled extension needs 18)"
-    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql sc_pglib--1.7--1.8.sql sc_pglib--1.8--1.9.sql sc_pglib--1.9--1.10.sql sc_pglib--1.10--1.11.sql sc_pglib--1.11--1.12.sql; do
+    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql sc_pglib--1.7--1.8.sql sc_pglib--1.8--1.9.sql sc_pglib--1.9--1.10.sql sc_pglib--1.10--1.11.sql sc_pglib--1.11--1.12.sql sc_pglib--1.12--1.13.sql; do
         sed -e '/^\\echo/d' -e "s|MODULE_PATHNAME|$library|g" "$sql_dir/$step" | psql_run
     done
     check_extension=0
@@ -429,16 +429,45 @@ else
     echo "skipped: password checks (set SC_REDIS_TEST_PASSWORD)"
 fi
 
+# --- Firebase ---
+# Without the network: the options are checked, a missing user mapping is named, and a key whose
+# token_uri is a closed local port fails at once, as an ERROR, or a WARNING and NULL.
+check "~needs the url option" "create server fb_bad foreign data wrapper sc_firebase"
+check "~url must start with https://" "create server fb_bad foreign data wrapper sc_firebase options (url 'http://example.com')"
+check "~invalid option \"server\"" "create server fb_bad foreign data wrapper sc_firebase options (url 'https://example-app.firebaseio.com', server 'x')"
+check "~on_error must be" "create server fb_bad foreign data wrapper sc_firebase options (url 'https://example-app.firebaseio.com', on_error 'maybe')"
+check "~timeout_ms must be" "create server fb_bad foreign data wrapper sc_firebase options (url 'https://example-app.firebaseio.com', timeout_ms '5')"
+check "" "create server fb foreign data wrapper sc_firebase options (url 'https://example-app.firebaseio.com', root 'devices')"
+check "~no user mapping with service_account or credentials_file" "select sc_firebase_get('fb', 'x')"
+check "~Valid options are service_account" "create user mapping for current_user server fb options (password 'x')"
+check "~not both" "create user mapping for current_user server fb options (service_account '{}', credentials_file '/x')"
+check "~is not a sc_firebase server" "create server fb_redis foreign data wrapper sc_redis options (servers 'x'); select sc_firebase_get('fb_redis', 'x')"
+if command -v openssl >/dev/null; then
+    key=$(openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 2>/dev/null | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+    account='{"type": "service_account", "client_email": "test@example-app.iam.gserviceaccount.com", "token_uri": "https://127.0.0.1:1/token", "private_key": '"$key"'}'
+    account_sql=${account//\'/\'\'}
+    check "" "create user mapping for current_user server fb options (service_account '$account_sql')"
+    check "~Firebase server \"fb\": sc::firebase: access token: no answer" "select sc_firebase_get('fb', '42')"
+    check "" "create server fb_quiet foreign data wrapper sc_firebase options (url 'https://example-app.firebaseio.com', on_error 'warning'); create user mapping for current_user server fb_quiet options (service_account '$account_sql')"
+    expect "on_error warning: a WARNING and NULL" "~WARNING:  Firebase server \"fb_quiet\"" "$(session <<<"select sc_firebase_get('fb_quiet', '42') is null")"
+    check "~WARNING" "select sc_firebase_set('fb_quiet', '42', '{\"online\": 1}')"
+    check "~WARNING" "select sc_firebase_move('fb_quiet', 'a', 'b')"
+else
+    echo "skipped: Firebase key checks (no openssl)"
+fi
+
 if [ "$check_extension" = 1 ]; then
-    check "sc_pglib|1.12" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.13" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "" "set client_min_messages = warning; drop extension sc_pglib cascade"
-    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_mkdir', 'sc_xlsx_sheets', 'sc_csv', 'sc_read_csv', 'sc_csvzip', 'sc_read_csvzip', 'sc_move', 'sc_list_files', 'sc_remove_log'))"
+    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname like 'sc_firebase%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_mkdir', 'sc_xlsx_sheets', 'sc_csv', 'sc_read_csv', 'sc_csvzip', 'sc_read_csvzip', 'sc_move', 'sc_list_files', 'sc_remove_log'))"
     # Updating from 1.0, as an existing database does.
     check "" "create extension sc_pglib version '1.0'"
     check "f" "select exists (select 1 from pg_proc where proname = 'sc_redis_get')"
     check "" "alter extension sc_pglib update"
-    check "sc_pglib|1.12" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.13" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_redis')"
+    check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_firebase')"
+    check "7" "select count(*) from pg_proc where proname like 'sc_firebase_%' and proname <> 'sc_firebase_validator'"
     check "t" "select exists (select 1 from pg_proc where proname = 'sc_redis_hgetall')"
     check "2" "select count(*) from pg_proc where proname = 'sc_redis_sadd'"
     check "7" "select count(*) from pg_proc where proname = 'sc_xlsx'"
