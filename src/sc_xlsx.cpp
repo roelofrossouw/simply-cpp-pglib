@@ -19,9 +19,18 @@
 // of its rows from the first, each row its cells from column A up to its last one set (an empty
 // row is []); a cell is a number, text, true/false or null (none). A number shown with a date or
 // time format is text: "2026-10-31", "2026-10-31 14:05:00" or "14:05:00". A formula gives the
-// value it last calculated. sc_read_xlsx(path, sheet) gives that one sheet's rows (ignoring case;
-// an error when there's no such sheet). As COPY from a file: superusers and pg_read_server_files
-// only, an absolute path.
+// value it last calculated.
+//
+// sc_read_xlsx(path, sheet [, from_row]) gives one sheet's rows as rows, the sheet by name (ignoring
+// case) or number (1 is the first), from from_row on (2 skips a row of headings), into the call's
+// column definition list: each column named after a sheet
+// column (a, b, ... aa) gets that column's cell, converted to the column's type from its text (as
+// above: numbers, true/false, dates as ISO text); a column named "row" gets the row number. Empty
+// rows are left out, empty cells are NULL. sc_xlsx_sheets(path) lists the sheets, numbered.
+//
+//   SELECT * FROM sc_read_xlsx('/var/www/data/input/prices.xlsx', 1, 2) AS x("row" int, a text, b numeric);
+//
+// Reading is as COPY from a file: superusers and pg_read_server_files only, an absolute path.
 //
 // Writing works in three steps, as pg_glue.h has it: the arguments read and checked (C++), the queries
 // run through SPI into plain data (PostgreSQL, which may raise), then the workbook made and
@@ -31,10 +40,14 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <exception>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
@@ -49,13 +62,17 @@ extern "C" {
 #include <miscadmin.h>
 #include <utils/acl.h>
 #include <utils/builtins.h>
+#include <funcapi.h>
 #include <utils/date.h>
+#include <utils/lsyscache.h>
 #include <utils/jsonb.h>
 #include <utils/timestamp.h>
 
 PG_FUNCTION_INFO_V1(sc_xlsx_query);
 PG_FUNCTION_INFO_V1(sc_xlsx_sheets);
 PG_FUNCTION_INFO_V1(sc_read_xlsx);
+PG_FUNCTION_INFO_V1(sc_read_xlsx_rows);
+PG_FUNCTION_INFO_V1(sc_xlsx_sheet_names);
 }
 
 namespace {
@@ -393,13 +410,249 @@ namespace {
     }
 }
 
-// sc_read_xlsx(path text [, sheet text]) -> json
+namespace {
+    // A cell's value as text, as sc_read_xlsx's json has it (a date or time as ISO text), or none
+    template<typename Cell>
+    std::optional<std::string> cell_text(const Cell &cell) {
+        if (const auto *number = std::get_if<double>(&cell.value)) {
+            const auto [date, time] = date_or_time(cell.style.number_format);
+            if (date || time) return serial_text(*number, date, time);
+            if (std::nearbyint(*number) == *number && std::fabs(*number) < 9007199254740992.0) return std::to_string(static_cast<std::int64_t>(*number));
+            return nlohmann::json(*number).dump();
+        }
+        if (const auto *text = std::get_if<std::string>(&cell.value)) return *text;
+        if (const auto *flag = std::get_if<bool>(&cell.value)) return *flag ? "true" : "false";
+        return std::nullopt;
+    }
+
+    // A sheet's rows as plain data in PostgreSQL's memory (no destructors): each row its number (from 1)
+    // and its cells from column A, nullptr for an empty one
+    struct read_row {
+        int number = 0;
+        int count = 0;
+        const char **cells = nullptr;
+    };
+
+    struct read_rows {
+        int count = 0;
+        read_row *rows = nullptr;
+    };
+
+    // The sheet named (ignoring case), or the one at number (from 1)
+    template<typename Book>
+    const auto &find_sheet(const Book &book, const char *name, const int number) {
+        if (name) {
+            if (!book.contains(name)) throw std::invalid_argument(std::string{"there's no sheet \""} + name + "\"");
+            return book.at(name);
+        }
+        int at = 0;
+        for (const auto &sheet: book)
+            if (++at == number) return sheet;
+        throw std::invalid_argument("there's no sheet " + std::to_string(number) + " (the workbook has " + std::to_string(at) + ")");
+    }
+
+    // One sheet's rows that have a value, into out. Never raises.
+    void read_sheet_rows(const char *path, const char *name, const int number, const int from_row, read_rows &out,
+                         sc_pglib::pending_error &error) noexcept {
+        try {
+            const auto book = sc::office::excel::read(path);
+            const auto &sheet = find_sheet(book, name, number);
+            std::vector<std::pair<int, std::vector<std::optional<std::string>>>> rows;
+            for (const auto &row: sheet) {
+                if (static_cast<int>(row.index()) + 1 < from_row) continue;
+                std::vector<std::optional<std::string>> cells;
+                for (const auto &cell: row) {
+                    auto text = cell_text(cell);
+                    if (!text) continue;
+                    if (cells.size() <= cell.column) cells.resize(cell.column + 1);
+                    cells[cell.column] = std::move(text);
+                }
+                if (!cells.empty()) rows.emplace_back(static_cast<int>(row.index()) + 1, std::move(cells));
+            }
+            out.rows = static_cast<read_row *>(sc_pglib::alloc_no_oom(sizeof(read_row) * std::max<std::size_t>(rows.size(), 1), error));
+            if (!out.rows) return;
+            for (const auto &[row_number, cells]: rows) {
+                read_row &row = out.rows[out.count++];
+                row = read_row{row_number, static_cast<int>(cells.size()), nullptr};
+                row.cells = static_cast<const char **>(sc_pglib::alloc_no_oom(sizeof(char *) * cells.size(), error));
+                if (!row.cells) return;
+                for (std::size_t c = 0; c < cells.size(); ++c) {
+                    row.cells[c] = cells[c] ? sc_pglib::new_cstring(*cells[c], error) : nullptr;
+                    if (error.any()) return;
+                }
+            }
+        } catch (const std::exception &problem) {
+            error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "sc_read_xlsx: \"%s\": %s", path, problem.what());
+        } catch (...) {
+            error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "sc_read_xlsx: unexpected C++ exception");
+        }
+    }
+
+    // The workbook's sheet names, in order, into names. Never raises.
+    int read_sheet_names(const char *path, const char **&names, sc_pglib::pending_error &error) noexcept {
+        try {
+            const auto book = sc::office::excel::read(path);
+            std::vector<std::string> list;
+            for (const auto &sheet: book) list.push_back(sheet.name());
+            names = static_cast<const char **>(sc_pglib::alloc_no_oom(sizeof(char *) * std::max<std::size_t>(list.size(), 1), error));
+            if (!names) return 0;
+            for (std::size_t i = 0; i < list.size(); ++i) {
+                names[i] = sc_pglib::new_cstring(list[i], error);
+                if (error.any()) return 0;
+            }
+            return static_cast<int>(list.size());
+        } catch (const std::exception &problem) {
+            error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "sc_xlsx_sheets: \"%s\": %s", path, problem.what());
+        } catch (...) {
+            error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "sc_xlsx_sheets: unexpected C++ exception");
+        }
+        return 0;
+    }
+
+    // COPY's rule for reading a file: pg_read_server_files, an absolute path. PostgreSQL code: raises.
+    const char *readable_path(PG_FUNCTION_ARGS, const char *function) {
+        if (!has_privs_of_role(GetUserId(), ROLE_PG_READ_SERVER_FILES))
+            ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("%s: permission denied to read a file", function),
+                            errdetail("Only roles with the privileges of the \"pg_read_server_files\" role may, as with COPY from a file.")));
+        const char *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
+        if (path[0] != '/') ereport(ERROR, (errcode(ERRCODE_INVALID_NAME), errmsg("%s: the path must be absolute: \"%s\"", function, path)));
+        return path;
+    }
+
+    // The function's rows go into a tuplestore of its result's shape. PostgreSQL code: raises.
+    Tuplestorestate *start_rows(PG_FUNCTION_ARGS, TupleDesc description) {
+        auto *result = reinterpret_cast<ReturnSetInfo *>(fcinfo->resultinfo);
+        if (!result || !IsA(result, ReturnSetInfo) || !(result->allowedModes & SFRM_Materialize))
+            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("set-valued function called in context that cannot accept a set")));
+        const MemoryContext previous = MemoryContextSwitchTo(result->econtext->ecxt_per_query_memory);
+        Tuplestorestate *store = tuplestore_begin_heap(true, false, work_mem);
+        result->returnMode = SFRM_Materialize;
+        result->setResult = store;
+        result->setDesc = CreateTupleDescCopy(description);
+        MemoryContextSwitchTo(previous);
+        return store;
+    }
+
+    // A sheet column's letters (a, z, aa, ...: any case) as its index from 0; -1 for anything else
+    int column_index(const char *name) {
+        const std::size_t length = std::strlen(name);
+        if (length == 0 || length > 3) return -1;
+        int index = 0;
+        for (std::size_t i = 0; i < length; ++i) {
+            const char c = static_cast<char>(name[i] | 0x20);
+            if (c < 'a' || c > 'z') return -1;
+            index = index * 26 + (c - 'a' + 1);
+        }
+        return index - 1;
+    }
+
+    std::string column_letters(int index) {
+        std::string letters;
+        for (++index; index > 0; index = (index - 1) / 26) letters.insert(letters.begin(), static_cast<char>('A' + (index - 1) % 26));
+        return letters;
+    }
+
+    // The cell a value comes from, for errors converting it ("CONTEXT: sc_read_xlsx: cell B7")
+    struct cell_place {
+        char column[8] = {};
+        int row = 0;
+    };
+
+    void cell_context(void *place) {
+        const auto *cell = static_cast<const cell_place *>(place);
+        errcontext("sc_read_xlsx: cell %s%d", cell->column, cell->row);
+    }
+}
+
+// sc_read_xlsx(path text, sheet text or integer, from_row integer) -> SETOF record
+extern "C" Datum sc_read_xlsx_rows(PG_FUNCTION_ARGS) {
+    const char *path = readable_path(fcinfo, "sc_read_xlsx");
+    const char *name = nullptr;
+    int number = 0;
+    if (get_fn_expr_argtype(fcinfo->flinfo, 1) == INT4OID) {
+        number = PG_GETARG_INT32(1);
+        if (number < 1) ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("sc_read_xlsx: sheets are numbered from 1, not %d", number)));
+    } else {
+        name = text_to_cstring(PG_GETARG_TEXT_PP(1));
+    }
+    const int from_row = PG_NARGS() > 2 ? PG_GETARG_INT32(2) : 1;
+    if (from_row < 1) ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("sc_read_xlsx: rows are numbered from 1, not %d", from_row)));
+    TupleDesc description = nullptr;
+    if (get_call_result_type(fcinfo, nullptr, &description) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("sc_read_xlsx: name the columns you want"),
+                        errhint("SELECT * FROM sc_read_xlsx(path, sheet) AS x(a text, b numeric)")));
+
+    // Each column: its sheet column (-1 for the row number), and its type's input function
+    const int columns = description->natts;
+    auto *sources = static_cast<int *>(palloc(sizeof(int) * Max(columns, 1)));
+    auto *inputs = static_cast<FmgrInfo *>(palloc(sizeof(FmgrInfo) * Max(columns, 1)));
+    auto *parameters = static_cast<Oid *>(palloc(sizeof(Oid) * Max(columns, 1)));
+    for (int c = 0; c < columns; ++c) {
+        const Form_pg_attribute attribute = TupleDescAttr(description, c);
+        const char *column = NameStr(attribute->attname);
+        sources[c] = pg_strcasecmp(column, "row") == 0 ? -1 : column_index(column);
+        if (sources[c] == -1 && pg_strcasecmp(column, "row") != 0)
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                            errmsg("sc_read_xlsx: column \"%s\" isn't a sheet column (a, b, ... aa) or \"row\"", column)));
+        Oid function;
+        getTypeInputInfo(attribute->atttypid, &function, &parameters[c]);
+        fmgr_info(function, &inputs[c]);
+    }
+
+    read_rows data;
+    sc_pglib::pending_error error;
+    read_sheet_rows(path, name, number, from_row, data, error);
+    error.raise();
+
+    Tuplestorestate *store = start_rows(fcinfo, description);
+    auto *values = static_cast<Datum *>(palloc(sizeof(Datum) * Max(columns, 1)));
+    auto *nulls = static_cast<bool *>(palloc(sizeof(bool) * Max(columns, 1)));
+    cell_place place;
+    ErrorContextCallback context{error_context_stack, cell_context, &place};
+    error_context_stack = &context;
+    for (int r = 0; r < data.count; ++r) {
+        const read_row &row = data.rows[r];
+        for (int c = 0; c < columns; ++c) {
+            const int32 typmod = TupleDescAttr(description, c)->atttypmod;
+            const char *text = sources[c] == -1 ? psprintf("%d", row.number) : sources[c] < row.count ? row.cells[sources[c]] : nullptr;
+            nulls[c] = text == nullptr;
+            values[c] = 0;
+            if (text) {
+                const std::string letters = sources[c] == -1 ? std::string("row ") : column_letters(sources[c]);
+                strlcpy(place.column, letters.c_str(), sizeof place.column);
+                place.row = row.number;
+                values[c] = InputFunctionCall(&inputs[c], const_cast<char *>(text), parameters[c], typmod);
+            }
+        }
+        tuplestore_putvalues(store, description, values, nulls);
+    }
+    error_context_stack = context.previous;
+    return (Datum) 0;
+}
+
+// sc_xlsx_sheets(path text) -> TABLE(sheet integer, name text)
+extern "C" Datum sc_xlsx_sheet_names(PG_FUNCTION_ARGS) {
+    const char *path = readable_path(fcinfo, "sc_xlsx_sheets");
+    TupleDesc description = nullptr;
+    if (get_call_result_type(fcinfo, nullptr, &description) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR, (errcode(ERRCODE_DATATYPE_MISMATCH), errmsg("sc_xlsx_sheets: unexpected result type")));
+    const char **names = nullptr;
+    sc_pglib::pending_error error;
+    const int count = read_sheet_names(path, names, error);
+    error.raise();
+    Tuplestorestate *store = start_rows(fcinfo, description);
+    for (int i = 0; i < count; ++i) {
+        Datum values[2] = {Int32GetDatum(i + 1), CStringGetTextDatum(names[i])};
+        bool nulls[2] = {false, false};
+        tuplestore_putvalues(store, description, values, nulls);
+    }
+    return (Datum) 0;
+}
+
+// sc_read_xlsx(path text) -> json
 extern "C" Datum sc_read_xlsx(PG_FUNCTION_ARGS) {
-    if (!has_privs_of_role(GetUserId(), ROLE_PG_READ_SERVER_FILES))
-        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("sc_read_xlsx: permission denied to read a file"),
-                        errdetail("Only roles with the privileges of the \"pg_read_server_files\" role may, as with COPY from a file.")));
-    const char *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
-    if (path[0] != '/') ereport(ERROR, (errcode(ERRCODE_INVALID_NAME), errmsg("sc_read_xlsx: the path must be absolute: \"%s\"", path)));
+    const char *path = readable_path(fcinfo, "sc_read_xlsx");
+    // 1.5's sc_read_xlsx(path, sheet) also came here, for one sheet's json, until the extension is updated
     const char *only = PG_NARGS() > 1 ? text_to_cstring(PG_GETARG_TEXT_PP(1)) : nullptr;
     sc_pglib::pending_error error;
     struct varlena *result = read_workbook(path, only, error);

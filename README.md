@@ -93,22 +93,33 @@ SELECT sc_xlsx('/var/www/data/output/result.xlsx',
   as a query.
 - The rows are held in memory until the file is written.
 
-`sc_read_xlsx` reads one back as `json`:
+`sc_read_xlsx` reads one back. A sheet's rows come back as rows, into the columns you name after the
+sheet's column letters, each with the type you want; `row` is the row number:
 
 ```sql
-SELECT sc_read_xlsx('/var/www/data/input/prices.xlsx');
--- {"Prices": [["Item", "Price", "From"], ["Tea", 18.5, "2026-10-31"], [], ["Total", 18.5]], "Notes": [...]}
+-- The sheets, numbered
+SELECT * FROM sc_xlsx_sheets('/var/www/data/input/prices.xlsx');   -- 1 | Prices, 2 | Notes
 
--- One sheet's rows (its name ignoring case), for an import:
-SELECT r ->> 0 AS item, (r ->> 1)::numeric AS price
-  FROM json_array_elements(sc_read_xlsx('/var/www/data/input/prices.xlsx', 'Prices')) WITH ORDINALITY AS x(r, n)
- WHERE n > 1;
+-- The first sheet from row 2 (under its headings): columns A, B and D
+SELECT * FROM sc_read_xlsx('/var/www/data/input/prices.xlsx', 1, 2) AS x("row" int, a text, b numeric, d date);
+
+-- By name (ignoring case), into a table
+INSERT INTO prices (item, price)
+SELECT a, b FROM sc_read_xlsx('/var/www/data/input/prices.xlsx', 'Prices', 2) AS x(a text, b numeric);
+
+-- Every sheet as json: {"Prices": [["Item", "Price", "From"], ["Tea", 18.5, "2026-10-31"], [], ["Total", 18.5]], "Notes": [...]}
+SELECT sc_read_xlsx('/var/www/data/input/prices.xlsx');
 ```
 
 | Function | Returns | Notes |
 |---|---|---|
+| `sc_read_xlsx(path text, sheet text, from_row integer = 1)` | `SETOF record` | that sheet's rows from `from_row` on, empty ones left out; needs a column list `AS x(a text, ...)`: columns `a`, `b`, ... `aa` (any case) and `row`; an empty cell is `NULL`, a value that doesn't convert is an error naming the cell; since 1.6 (it was `json` before) |
+| `sc_read_xlsx(path text, sheet integer, from_row integer = 1)` | `SETOF record` | the same, the sheet by its place (1 is the first) |
+| `sc_xlsx_sheets(path text)` | `TABLE(sheet integer, name text)` | the sheets in the workbook's order |
 | `sc_read_xlsx(path text)` | `json` | every sheet, in the workbook's order: `{"Sheet": [rows]}` |
-| `sc_read_xlsx(path text, sheet text)` | `json` | that sheet's rows; an error when there's none |
+
+A cell's value is a number, text or `true`/`false`; a number shown as a date or time reads as ISO text
+(`2026-10-31`, `2026-10-31 14:05:00`, `14:05:00`), so a `date`, `timestamp` or `time` column takes it.
 
 - Each sheet is an array of its rows from the first, each row an array of its cells from
   column A up to its last one set: plain arrays, no names repeated, so big sheets stay small.
@@ -211,11 +222,11 @@ How it behaves:
   because `ereport()` `longjmp()`s past destructors.
 - `sql/sc_pglib.control` and the `sql/sc_pglib--*.sql` scripts are what `CREATE
   EXTENSION` reads: `sc_pglib--1.0.sql` (base64) and the updates `1.0--1.1`
-  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`) and `1.4--1.5` (`sc_read_xlsx`). They and the module install into the server's own directories
+  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`), `1.4--1.5` (`sc_read_xlsx`) and `1.5--1.6` (sheets as rows, `sc_xlsx_sheets`). They and the module install into the server's own directories
   (`pg_config --sharedir`/extension and `--pkglibdir`).
-- The extension version (`1.5`) is separate from the package version. A package
+- The extension version (`1.6`) is separate from the package version. A package
   update replaces the module in place; adding or changing SQL objects needs a new
-  extension version with an update script (`sc_pglib--1.5--1.6.sql`), after which
+  extension version with an update script (`sc_pglib--1.6--1.7.sql`), after which
   databases run `ALTER EXTENSION sc_pglib UPDATE`.
 
 ## Building

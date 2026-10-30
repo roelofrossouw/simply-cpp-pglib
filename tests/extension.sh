@@ -60,7 +60,7 @@ if [ "$major" -ge 18 ]; then
     check_extension=1
 else
     echo "PostgreSQL $major: running the extension scripts directly (CREATE EXTENSION of an uninstalled extension needs 18)"
-    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql; do
+    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql; do
         sed -e '/^\\echo/d' -e "s|MODULE_PATHNAME|$library|g" "$sql_dir/$step" | psql_run
     done
     check_extension=0
@@ -162,15 +162,32 @@ check "~relation \"no_such_table\" does not exist" "select sc_xlsx('$work/x.xlsx
 # Read back: each sheet its rows, a date as ISO text, an empty cell null, the sheets in order.
 check '{"Sheet1":[["n","half","even","day","label","nothing"],[1,1.5,false,"2026-10-31","row 1"],[2,3,true,"2026-11-01","row 2"],[3,4.5,false,"2026-11-02","row 3"]]}' "select sc_read_xlsx('$work/one.xlsx')"
 check 'Zeta,Alpha' "select string_agg(k, ',') from json_object_keys(sc_read_xlsx('$work/two.xlsx')) k"
-check '4' "select json_array_length(sc_read_xlsx('$work/two.xlsx', 'alpha')) - 1"
+# One sheet's rows as rows: by name (any case) or number, columns by their letters, "row" the row number.
+check '4' "select count(*) - 1 from sc_read_xlsx('$work/two.xlsx', 'alpha') as x(a text)"
+check 'g,1,2,3,4' "select string_agg(a, ',') from sc_read_xlsx('$work/two.xlsx', 2) as x(a text)"
+check '1:Zeta,2:Alpha' "select string_agg(sheet || ':' || name, ',' order by sheet) from sc_xlsx_sheets('$work/two.xlsx')"
+check 'row 1,row 2,row 3' "select string_agg(e, ',') from sc_read_xlsx('$work/one.xlsx', 1) as x(\"row\" int, e text) where \"row\" > 1"
+check '6|9.0|1|2026-11-02' "select sum(a), sum(b), count(*) filter (where c), max(d) from sc_read_xlsx('$work/one.xlsx', 'Sheet1', 2) as x(a int, b numeric, c boolean, d date)"
+check '2|row 1|1' "select \"row\", e, a from sc_read_xlsx('$work/one.xlsx', 1, 2) as x(e text, \"row\" int, a int) where \"row\" = 2"
+check '3' "select count(*) from sc_read_xlsx('$work/one.xlsx', 1, 2) as x(a int)"
+check "~rows are numbered from 1" "select * from sc_read_xlsx('$work/one.xlsx', 1, 0) as x(a text)"
+check '||' "select f, g, aa from sc_read_xlsx('$work/one.xlsx', 1) as x(\"row\" int, f text, g text, aa text) where \"row\" = 2"
+check "~cell E2" "select * from sc_read_xlsx('$work/one.xlsx', 1, 2) as x(e int)"
+check "~numbered from 1" "select * from sc_read_xlsx('$work/one.xlsx', 0) as x(a text)"
+check "~there's no sheet 3 (the workbook has 2)" "select * from sc_read_xlsx('$work/two.xlsx', 3) as x(a text)"
+check "~isn't a sheet column" "select * from sc_read_xlsx('$work/one.xlsx', 1) as x(price numeric)"
+check "~column definition list is required" "select * from sc_read_xlsx('$work/one.xlsx', 1)"
 check "1" "select sc_xlsx('$work/times.xlsx', 'select timestamp ''2026-10-30 14:05:06'' as at, time ''14:05:06'' as t, true as yes, null::int as gap, 7 as seven')"
-check '[["at","t","yes","gap","seven"],["2026-10-30 14:05:06","14:05:06",true,null,7]]' "select sc_read_xlsx('$work/times.xlsx', 'Sheet1')"
-check '[["one"]]' "select sc_read_xlsx('$work/empty.xlsx', 'Sheet1')"
-check "~there's no sheet \"Nope\"" "select sc_read_xlsx('$work/one.xlsx', 'Nope')"
+check '{"Sheet1":[["at","t","yes","gap","seven"],["2026-10-30 14:05:06","14:05:06",true,null,7]]}' "select sc_read_xlsx('$work/times.xlsx')"
+check '2026-10-30 14:05:06|14:05:06|t||7' "select * from sc_read_xlsx('$work/times.xlsx', 'Sheet1', 2) as x(a timestamp, b time, c boolean, d int, e int)"
+check 'one' "select * from sc_read_xlsx('$work/empty.xlsx', 1) as x(a text)"
+check "~there's no sheet \"Nope\"" "select * from sc_read_xlsx('$work/one.xlsx', 'Nope') as x(a text)"
 check "~the path must be absolute" "select sc_read_xlsx('one.xlsx')"
 check "~sc_read_xlsx: \"$work/missing.xlsx\"" "select sc_read_xlsx('$work/missing.xlsx')"
 check "" "create role sc_pglib_writer"
 check "~permission denied to read a file" "set role sc_pglib_writer; select sc_read_xlsx('$work/one.xlsx')"
+check "~permission denied to read a file" "set role sc_pglib_writer; select * from sc_read_xlsx('$work/one.xlsx', 1) as x(a text)"
+check "~permission denied to read a file" "set role sc_pglib_writer; select * from sc_xlsx_sheets('$work/one.xlsx')"
 check "~permission denied to write a file" "set role sc_pglib_writer; select sc_xlsx('$work/x.xlsx', 'select 1')"
 check "f" "select '$( [ -e "$work/x.xlsx" ] && echo t || echo f)'"
 
@@ -279,19 +296,22 @@ else
 fi
 
 if [ "$check_extension" = 1 ]; then
-    check "sc_pglib|1.5" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.6" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "" "set client_min_messages = warning; drop extension sc_pglib cascade"
-    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname in ('sc_xlsx', 'sc_read_xlsx'))"
+    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_xlsx_sheets'))"
     # Updating from 1.0, as an existing database does.
     check "" "create extension sc_pglib version '1.0'"
     check "f" "select exists (select 1 from pg_proc where proname = 'sc_redis_get')"
     check "" "alter extension sc_pglib update"
-    check "sc_pglib|1.5" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.6" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_redis')"
     check "t" "select exists (select 1 from pg_proc where proname = 'sc_redis_hgetall')"
     check "2" "select count(*) from pg_proc where proname = 'sc_redis_sadd'"
     check "4" "select count(*) from pg_proc where proname = 'sc_xlsx'"
-    check "2" "select count(*) from pg_proc where proname = 'sc_read_xlsx'"
+    check "3" "select count(*) from pg_proc where proname = 'sc_read_xlsx'"
+    check "2" "select count(*) from pg_proc where proname = 'sc_read_xlsx' and pronargdefaults = 1"
+    check "t" "select pg_get_function_result(oid) = 'SETOF record' from pg_proc where proname = 'sc_read_xlsx' and pronargs = 3 and proargtypes[1] = 'text'::regtype"
+    check "1" "select count(*) from pg_proc where proname = 'sc_xlsx_sheets'"
 fi
 
 if [ "$failures" -ne 0 ]; then
