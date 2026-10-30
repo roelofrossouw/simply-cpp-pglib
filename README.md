@@ -93,6 +93,35 @@ SELECT sc_xlsx('/var/www/data/output/result.xlsx',
   as a query.
 - The rows are held in memory until the file is written.
 
+`sc_read_xlsx` reads one back as `json`:
+
+```sql
+SELECT sc_read_xlsx('/var/www/data/input/prices.xlsx');
+-- {"Prices": [["Item", "Price", "From"], ["Tea", 18.5, "2026-10-31"], [], ["Total", 18.5]], "Notes": [...]}
+
+-- One sheet's rows (its name ignoring case), for an import:
+SELECT r ->> 0 AS item, (r ->> 1)::numeric AS price
+  FROM json_array_elements(sc_read_xlsx('/var/www/data/input/prices.xlsx', 'Prices')) WITH ORDINALITY AS x(r, n)
+ WHERE n > 1;
+```
+
+| Function | Returns | Notes |
+|---|---|---|
+| `sc_read_xlsx(path text)` | `json` | every sheet, in the workbook's order: `{"Sheet": [rows]}` |
+| `sc_read_xlsx(path text, sheet text)` | `json` | that sheet's rows; an error when there's none |
+
+- Each sheet is an array of its rows from the first, each row an array of its cells from
+  column A up to its last one set: plain arrays, no names repeated, so big sheets stay small.
+  A row with nothing in it is `[]`, a cell with nothing in it `null`, and trailing empty
+  rows are left out.
+- A cell is a number (whole numbers without a fraction), text, `true`/`false` or `null`. A
+  number shown with a date or time format is ISO text: `"2026-10-31"`, `"2026-10-31
+  14:05:06"` or `"14:05:06"`. A formula gives the value Excel last calculated (`null` when
+  it never was); an error such as `#DIV/0!` is its text.
+- `json`, not `jsonb`, so the sheets keep their order; cast to `jsonb` to index into it.
+- The rule is COPY's: only superusers and roles with the privileges of
+  `pg_read_server_files` may, and the path is absolute.
+
 ## Redis
 
 `sc_pglib` talks to Redis (standalone or Cluster) through `sc::redis`, mainly
@@ -182,11 +211,11 @@ How it behaves:
   because `ereport()` `longjmp()`s past destructors.
 - `sql/sc_pglib.control` and the `sql/sc_pglib--*.sql` scripts are what `CREATE
   EXTENSION` reads: `sc_pglib--1.0.sql` (base64) and the updates `1.0--1.1`
-  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets) and `1.3--1.4` (`sc_xlsx`). They and the module install into the server's own directories
+  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`) and `1.4--1.5` (`sc_read_xlsx`). They and the module install into the server's own directories
   (`pg_config --sharedir`/extension and `--pkglibdir`).
-- The extension version (`1.4`) is separate from the package version. A package
+- The extension version (`1.5`) is separate from the package version. A package
   update replaces the module in place; adding or changing SQL objects needs a new
-  extension version with an update script (`sc_pglib--1.4--1.5.sql`), after which
+  extension version with an update script (`sc_pglib--1.5--1.6.sql`), after which
   databases run `ALTER EXTENSION sc_pglib UPDATE`.
 
 ## Building

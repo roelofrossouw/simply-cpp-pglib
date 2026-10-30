@@ -15,7 +15,15 @@
 // format, NULL as an empty cell, anything else as its text. Columns are as wide as their contents
 // (up to 80 characters). Returns how many rows were written, all sheets together.
 //
-// It works in three steps, as pg_glue.h has it: the arguments read and checked (C++), the queries
+// sc_read_xlsx(path) reads one back as json: {"Sheet": [[cell, ...], ...], ...}, each sheet an array
+// of its rows from the first, each row its cells from column A up to its last one set (an empty
+// row is []); a cell is a number, text, true/false or null (none). A number shown with a date or
+// time format is text: "2026-10-31", "2026-10-31 14:05:00" or "14:05:00". A formula gives the
+// value it last calculated. sc_read_xlsx(path, sheet) gives that one sheet's rows (ignoring case;
+// an error when there's no such sheet). As COPY from a file: superusers and pg_read_server_files
+// only, an absolute path.
+//
+// Writing works in three steps, as pg_glue.h has it: the arguments read and checked (C++), the queries
 // run through SPI into plain data (PostgreSQL, which may raise), then the workbook made and
 // written (C++).
 
@@ -24,6 +32,8 @@
 #include <nlohmann/json.hpp>
 
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <string>
 #include <string_view>
@@ -45,6 +55,7 @@ extern "C" {
 
 PG_FUNCTION_INFO_V1(sc_xlsx_query);
 PG_FUNCTION_INFO_V1(sc_xlsx_sheets);
+PG_FUNCTION_INFO_V1(sc_read_xlsx);
 }
 
 namespace {
@@ -275,6 +286,125 @@ namespace {
         error.raise();
         PG_RETURN_INT64(rows);
     }
+}
+
+namespace {
+    // Whether an Excel number format shows a date (or time): its codes outside quoted text,
+    // escapes and [colour]/[$-locale] sections have y, d (date) or h, s (time).
+    std::pair<bool, bool> date_or_time(const std::string_view format) {
+        bool date = false, time = false, quoted = false, bracket = false;
+        for (std::size_t i = 0; i < format.size(); ++i) {
+            const char c = format[i];
+            if (quoted) {
+                quoted = c != '"';
+            } else if (bracket) {
+                bracket = c != ']';
+                // [h]:mm elapsed hours are a time
+                if ((c == 'h' || c == 'H' || c == 's' || c == 'S') && i > 0 && format[i - 1] == '[') time = true;
+            } else if (c == '"') {
+                quoted = true;
+            } else if (c == '[') {
+                bracket = true;
+            } else if (c == '\\' || c == '_' || c == '*') {
+                ++i;
+            } else if (c == 'y' || c == 'Y' || c == 'd' || c == 'D') {
+                date = true;
+            } else if (c == 'h' || c == 'H' || c == 's' || c == 'S') {
+                time = true;
+            }
+        }
+        return {date, time};
+    }
+
+    // An Excel serial (days since 1899-12-30) as ISO text: the date, the time, or both.
+    std::string serial_text(const double serial, const bool date, const bool time) {
+        auto days = static_cast<std::int64_t>(std::floor(serial));
+        auto seconds = static_cast<std::int64_t>(std::llround((serial - static_cast<double>(days)) * 86400));
+        if (seconds >= 86400) ++days, seconds -= 86400;
+        // Civil from days (Howard Hinnant's algorithm), from 1970-01-01 = serial 25569.
+        const std::int64_t z = days - 25569 + 719468;
+        const std::int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+        const auto doe = static_cast<unsigned>(z - era * 146097);
+        const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        const unsigned mp = (5 * doy + 2) / 153;
+        const unsigned day = doy - (153 * mp + 2) / 5 + 1;
+        const unsigned month = mp < 10 ? mp + 3 : mp - 9;
+        const std::int64_t year = static_cast<std::int64_t>(yoe) + era * 400 + (month <= 2);
+        char text[40];
+        if (date && time)
+            snprintf(text, sizeof text, "%04lld-%02u-%02u %02lld:%02lld:%02lld", static_cast<long long>(year), month, day,
+                          static_cast<long long>(seconds / 3600), static_cast<long long>(seconds / 60 % 60), static_cast<long long>(seconds % 60));
+        else if (date)
+            snprintf(text, sizeof text, "%04lld-%02u-%02u", static_cast<long long>(year), month, day);
+        else
+            snprintf(text, sizeof text, "%02lld:%02lld:%02lld", static_cast<long long>(seconds / 3600), static_cast<long long>(seconds / 60 % 60),
+                          static_cast<long long>(seconds % 60));
+        return text;
+    }
+
+    nlohmann::ordered_json rows_of(const sc::office::excel::sheet &sheet) {
+        nlohmann::ordered_json rows = nlohmann::ordered_json::array();
+        for (const auto &row: sheet) {
+            while (rows.size() < row.index()) rows.push_back(nlohmann::ordered_json::array());
+            nlohmann::ordered_json cells = nlohmann::ordered_json::array();
+            for (const auto &cell: row) {
+                while (cells.size() < cell.column) cells.push_back(nullptr);
+                if (const auto *number = std::get_if<double>(&cell.value)) {
+                    const auto [date, time] = date_or_time(cell.style.number_format);
+                    if (date || time) cells.push_back(serial_text(*number, date, time));
+                    else if (std::nearbyint(*number) == *number && std::fabs(*number) < 9007199254740992.0) cells.push_back(static_cast<std::int64_t>(*number));
+                    else cells.push_back(*number);
+                } else if (const auto *text = std::get_if<std::string>(&cell.value)) {
+                    cells.push_back(*text);
+                } else if (const auto *flag = std::get_if<bool>(&cell.value)) {
+                    cells.push_back(*flag);
+                } else {
+                    cells.push_back(nullptr);
+                }
+            }
+            // A row with only styled cells and no values reads as [].
+            while (!cells.empty() && cells.back().is_null()) cells.erase(cells.size() - 1);
+            rows.push_back(std::move(cells));
+        }
+        while (!rows.empty() && rows.back().empty()) rows.erase(rows.size() - 1);
+        return rows;
+    }
+
+    // The workbook at path as json text (all sheets, or the one named), into a new text. Never raises.
+    struct varlena *read_workbook(const char *path, const char *only, sc_pglib::pending_error &error) noexcept {
+        try {
+            const auto book = sc::office::excel::read(path);
+            nlohmann::ordered_json out;
+            if (only) {
+                if (!book.contains(only)) throw std::invalid_argument(std::string{"there's no sheet \""} + only + "\"");
+                out = rows_of(book.at(only));
+            } else {
+                out = nlohmann::ordered_json::object();
+                for (const auto &sheet: book) out[sheet.name()] = rows_of(sheet);
+            }
+            return sc_pglib::new_varlena(out.dump(-1, ' ', false, nlohmann::ordered_json::error_handler_t::replace), error);
+        } catch (const std::exception &problem) {
+            error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "sc_read_xlsx: \"%s\": %s", path, problem.what());
+        } catch (...) {
+            error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "sc_read_xlsx: unexpected C++ exception");
+        }
+        return nullptr;
+    }
+}
+
+// sc_read_xlsx(path text [, sheet text]) -> json
+extern "C" Datum sc_read_xlsx(PG_FUNCTION_ARGS) {
+    if (!has_privs_of_role(GetUserId(), ROLE_PG_READ_SERVER_FILES))
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("sc_read_xlsx: permission denied to read a file"),
+                        errdetail("Only roles with the privileges of the \"pg_read_server_files\" role may, as with COPY from a file.")));
+    const char *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
+    if (path[0] != '/') ereport(ERROR, (errcode(ERRCODE_INVALID_NAME), errmsg("sc_read_xlsx: the path must be absolute: \"%s\"", path)));
+    const char *only = PG_NARGS() > 1 ? text_to_cstring(PG_GETARG_TEXT_PP(1)) : nullptr;
+    sc_pglib::pending_error error;
+    struct varlena *result = read_workbook(path, only, error);
+    error.raise();
+    PG_RETURN_POINTER(result);
 }
 
 // sc_xlsx(path text, query text [, sheet text]) -> bigint

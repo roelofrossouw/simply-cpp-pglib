@@ -108,7 +108,7 @@ if (APPLE)
     endif ()
 endif ()
 
-set(SC_PGLIB_EXTENSION_FILES sql/sc_pglib.control sql/sc_pglib--1.0.sql sql/sc_pglib--1.0--1.1.sql sql/sc_pglib--1.1--1.2.sql sql/sc_pglib--1.2--1.3.sql sql/sc_pglib--1.3--1.4.sql)
+set(SC_PGLIB_EXTENSION_FILES sql/sc_pglib.control sql/sc_pglib--1.0.sql sql/sc_pglib--1.0--1.1.sql sql/sc_pglib--1.1--1.2.sql sql/sc_pglib--1.2--1.3.sql sql/sc_pglib--1.3--1.4.sql sql/sc_pglib--1.4--1.5.sql)
 if (SC_PGLIB_INSTALL)
     install(TARGETS sc_pglib LIBRARY DESTINATION "${SC_PGLIB_PG_PKGLIBDIR}" COMPONENT runtime)
     install(FILES ${SC_PGLIB_EXTENSION_FILES} DESTINATION "${SC_PGLIB_PG_SHAREDIR}/extension" COMPONENT runtime)
