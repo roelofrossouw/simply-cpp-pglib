@@ -35,8 +35,22 @@
 // Writing works in three steps, as pg_glue.h has it: the arguments read and checked (C++), the queries
 // run through SPI into plain data (PostgreSQL, which may raise), then the workbook made and
 // written (C++).
+//
+// CSV files (sc::office::csv) the same way, without sheets:
+//
+//   sc_csv(path, query [, delimiter])  a query's rows, the columns' names first; numbers as numbers,
+//                                      booleans as TRUE/FALSE, NULL as an empty field, anything else
+//                                      (dates as ISO) as its text
+//   sc_read_csv(path [, from_row [, delimiter]])
+//                                      its rows as rows, as sc_read_xlsx(path, sheet, from_row)
+//                                      gives a sheet's; each field as written (no numbers guessed),
+//                                      converted to its column's type. The delimiter is found when
+//                                      not given: a comma, unless semicolons fit the file better.
+//
+//   SELECT * FROM sc_read_csv('/var/www/data/input/prices.csv', 2) AS x("row" int, a text, b numeric);
 
 #include <excel.h>
+#include <sc_csv.h>
 
 #include <nlohmann/json.hpp>
 
@@ -73,6 +87,8 @@ PG_FUNCTION_INFO_V1(sc_xlsx_sheets);
 PG_FUNCTION_INFO_V1(sc_read_xlsx);
 PG_FUNCTION_INFO_V1(sc_read_xlsx_rows);
 PG_FUNCTION_INFO_V1(sc_xlsx_sheet_names);
+PG_FUNCTION_INFO_V1(sc_csv_query);
+PG_FUNCTION_INFO_V1(sc_read_csv_rows);
 }
 
 namespace {
@@ -145,11 +161,12 @@ namespace {
         return MemoryContextStrdup(outer, text ? text : "");
     }
 
-    // Runs a sheet's query and keeps its rows as plain data in outer. PostgreSQL code: may raise.
-    void run_query(sheet_data &sheet, MemoryContext outer) {
+    // Runs a sheet's query and keeps its rows as plain data in outer; who names it in an error
+    // ("sc_xlsx: sheet \"Prices\""). PostgreSQL code: may raise.
+    void run_query(sheet_data &sheet, MemoryContext outer, const char *who) {
         SPI_execute(sheet.query, false, 0);
         if (!SPI_tuptable)
-            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("sc_xlsx: sheet \"%s\": its query returns no rows (it isn't a SELECT)", sheet.name)));
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("%s: its query returns no rows (it isn't a SELECT)", who)));
         const TupleDesc description = SPI_tuptable->tupdesc;
         sheet.columns = description->natts;
         sheet.rows = SPI_processed;
@@ -294,7 +311,7 @@ namespace {
 
         const MemoryContext outer = CurrentMemoryContext;
         if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("sc_xlsx: SPI_connect failed")));
-        for (int s = 0; s < count; ++s) run_query(sheets[s], outer);
+        for (int s = 0; s < count; ++s) run_query(sheets[s], outer, psprintf("sc_xlsx: sheet \"%s\"", sheets[s].name));
         SPI_finish();
 
         int64 rows = 0;
@@ -451,12 +468,16 @@ namespace {
         throw std::invalid_argument("there's no sheet " + std::to_string(number) + " (the workbook has " + std::to_string(at) + ")");
     }
 
-    // One sheet's rows that have a value, into out. Never raises.
-    void read_sheet_rows(const char *path, const char *name, const int number, const int from_row, read_rows &out,
-                         sc_pglib::pending_error &error) noexcept {
-        try {
-            const auto book = sc::office::excel::read(path);
-            const auto &sheet = find_sheet(book, name, number);
+    // A CSV cell's value as text: it was read as text, so it's what the file has.
+    std::optional<std::string> cell_text(const sc::office::csv::cell &cell) {
+        if (const auto *text = std::get_if<std::string>(&cell.value)) return *text;
+        return std::nullopt;
+    }
+
+    // A sheet's rows that have a value, from from_row on, into out (Excel's or CSV's). C++: throws.
+    template<typename Sheet>
+    void rows_into(const Sheet &sheet, const int from_row, read_rows &out, sc_pglib::pending_error &error) {
+        {
             std::vector<std::pair<int, std::vector<std::optional<std::string>>>> rows;
             for (const auto &row: sheet) {
                 if (static_cast<int>(row.index()) + 1 < from_row) continue;
@@ -481,10 +502,30 @@ namespace {
                     if (error.any()) return;
                 }
             }
+        }
+    }
+
+    // One sheet's rows that have a value, into out. Never raises.
+    void read_sheet_rows(const char *path, const char *name, const int number, const int from_row, read_rows &out,
+                         sc_pglib::pending_error &error) noexcept {
+        try {
+            const auto book = sc::office::excel::read(path);
+            rows_into(find_sheet(book, name, number), from_row, out, error);
         } catch (const std::exception &problem) {
             error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "sc_read_xlsx: \"%s\": %s", path, problem.what());
         } catch (...) {
             error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "sc_read_xlsx: unexpected C++ exception");
+        }
+    }
+
+    // A CSV file's rows that have a value, every field as text, into out. Never raises.
+    void read_csv_rows(const char *path, const char delimiter, const int from_row, read_rows &out, sc_pglib::pending_error &error) noexcept {
+        try {
+            rows_into(sc::office::csv::read(path, {.delimiter = delimiter, .typed = false}), from_row, out, error);
+        } catch (const std::exception &problem) {
+            error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "sc_read_csv: \"%s\": %s", path, problem.what());
+        } catch (...) {
+            error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "sc_read_csv: unexpected C++ exception");
         }
     }
 
@@ -554,13 +595,78 @@ namespace {
 
     // The cell a value comes from, for errors converting it ("CONTEXT: sc_read_xlsx: cell B7")
     struct cell_place {
+        const char *function = "";
         char column[8] = {};
         int row = 0;
     };
 
     void cell_context(void *place) {
         const auto *cell = static_cast<const cell_place *>(place);
-        errcontext("sc_read_xlsx: cell %s%d", cell->column, cell->row);
+        errcontext("%s: cell %s%d", cell->function, cell->column, cell->row);
+    }
+
+    // The call's column definition list: each column's sheet column (-1 for "row") and its type's
+    // input function. PostgreSQL code: raises.
+    struct column_plan {
+        TupleDesc description = nullptr;
+        int columns = 0;
+        int *sources = nullptr;
+        FmgrInfo *inputs = nullptr;
+        Oid *parameters = nullptr;
+    };
+
+    column_plan plan_columns(PG_FUNCTION_ARGS, const char *function) {
+        column_plan plan;
+        if (get_call_result_type(fcinfo, nullptr, &plan.description) != TYPEFUNC_COMPOSITE)
+            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("%s: name the columns you want", function),
+                            errhint("SELECT * FROM %s(...) AS x(a text, b numeric)", function)));
+        plan.columns = plan.description->natts;
+        plan.sources = static_cast<int *>(palloc(sizeof(int) * Max(plan.columns, 1)));
+        plan.inputs = static_cast<FmgrInfo *>(palloc(sizeof(FmgrInfo) * Max(plan.columns, 1)));
+        plan.parameters = static_cast<Oid *>(palloc(sizeof(Oid) * Max(plan.columns, 1)));
+        for (int c = 0; c < plan.columns; ++c) {
+            const Form_pg_attribute attribute = TupleDescAttr(plan.description, c);
+            const char *column = NameStr(attribute->attname);
+            plan.sources[c] = pg_strcasecmp(column, "row") == 0 ? -1 : column_index(column);
+            if (plan.sources[c] == -1 && pg_strcasecmp(column, "row") != 0)
+                ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                                errmsg("%s: column \"%s\" isn't a sheet column (a, b, ... aa) or \"row\"", function, column)));
+            Oid input;
+            getTypeInputInfo(attribute->atttypid, &input, &plan.parameters[c]);
+            fmgr_info(input, &plan.inputs[c]);
+        }
+        return plan;
+    }
+
+    // The rows read, each value converted to its column's type, as the function's result.
+    // PostgreSQL code: raises (a value its type won't take, with the cell it came from).
+    Datum put_rows(PG_FUNCTION_ARGS, const char *function, const column_plan &plan, const read_rows &data) {
+        Tuplestorestate *store = start_rows(fcinfo, plan.description);
+        auto *values = static_cast<Datum *>(palloc(sizeof(Datum) * Max(plan.columns, 1)));
+        auto *nulls = static_cast<bool *>(palloc(sizeof(bool) * Max(plan.columns, 1)));
+        cell_place place;
+        place.function = function;
+        ErrorContextCallback context{error_context_stack, cell_context, &place};
+        error_context_stack = &context;
+        for (int r = 0; r < data.count; ++r) {
+            const read_row &row = data.rows[r];
+            for (int c = 0; c < plan.columns; ++c) {
+                const int32 typmod = TupleDescAttr(plan.description, c)->atttypmod;
+                const int source = plan.sources[c];
+                const char *text = source == -1 ? psprintf("%d", row.number) : source < row.count ? row.cells[source] : nullptr;
+                nulls[c] = text == nullptr;
+                values[c] = 0;
+                if (text) {
+                    const std::string letters = source == -1 ? std::string("row ") : column_letters(source);
+                    strlcpy(place.column, letters.c_str(), sizeof place.column);
+                    place.row = row.number;
+                    values[c] = InputFunctionCall(&plan.inputs[c], const_cast<char *>(text), plan.parameters[c], typmod);
+                }
+            }
+            tuplestore_putvalues(store, plan.description, values, nulls);
+        }
+        error_context_stack = context.previous;
+        return (Datum) 0;
     }
 }
 
@@ -577,57 +683,12 @@ extern "C" Datum sc_read_xlsx_rows(PG_FUNCTION_ARGS) {
     }
     const int from_row = PG_NARGS() > 2 ? PG_GETARG_INT32(2) : 1;
     if (from_row < 1) ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("sc_read_xlsx: rows are numbered from 1, not %d", from_row)));
-    TupleDesc description = nullptr;
-    if (get_call_result_type(fcinfo, nullptr, &description) != TYPEFUNC_COMPOSITE)
-        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("sc_read_xlsx: name the columns you want"),
-                        errhint("SELECT * FROM sc_read_xlsx(path, sheet) AS x(a text, b numeric)")));
-
-    // Each column: its sheet column (-1 for the row number), and its type's input function
-    const int columns = description->natts;
-    auto *sources = static_cast<int *>(palloc(sizeof(int) * Max(columns, 1)));
-    auto *inputs = static_cast<FmgrInfo *>(palloc(sizeof(FmgrInfo) * Max(columns, 1)));
-    auto *parameters = static_cast<Oid *>(palloc(sizeof(Oid) * Max(columns, 1)));
-    for (int c = 0; c < columns; ++c) {
-        const Form_pg_attribute attribute = TupleDescAttr(description, c);
-        const char *column = NameStr(attribute->attname);
-        sources[c] = pg_strcasecmp(column, "row") == 0 ? -1 : column_index(column);
-        if (sources[c] == -1 && pg_strcasecmp(column, "row") != 0)
-            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                            errmsg("sc_read_xlsx: column \"%s\" isn't a sheet column (a, b, ... aa) or \"row\"", column)));
-        Oid function;
-        getTypeInputInfo(attribute->atttypid, &function, &parameters[c]);
-        fmgr_info(function, &inputs[c]);
-    }
-
+    const column_plan plan = plan_columns(fcinfo, "sc_read_xlsx");
     read_rows data;
     sc_pglib::pending_error error;
     read_sheet_rows(path, name, number, from_row, data, error);
     error.raise();
-
-    Tuplestorestate *store = start_rows(fcinfo, description);
-    auto *values = static_cast<Datum *>(palloc(sizeof(Datum) * Max(columns, 1)));
-    auto *nulls = static_cast<bool *>(palloc(sizeof(bool) * Max(columns, 1)));
-    cell_place place;
-    ErrorContextCallback context{error_context_stack, cell_context, &place};
-    error_context_stack = &context;
-    for (int r = 0; r < data.count; ++r) {
-        const read_row &row = data.rows[r];
-        for (int c = 0; c < columns; ++c) {
-            const int32 typmod = TupleDescAttr(description, c)->atttypmod;
-            const char *text = sources[c] == -1 ? psprintf("%d", row.number) : sources[c] < row.count ? row.cells[sources[c]] : nullptr;
-            nulls[c] = text == nullptr;
-            values[c] = 0;
-            if (text) {
-                const std::string letters = sources[c] == -1 ? std::string("row ") : column_letters(sources[c]);
-                strlcpy(place.column, letters.c_str(), sizeof place.column);
-                place.row = row.number;
-                values[c] = InputFunctionCall(&inputs[c], const_cast<char *>(text), parameters[c], typmod);
-            }
-        }
-        tuplestore_putvalues(store, description, values, nulls);
-    }
-    error_context_stack = context.previous;
-    return (Datum) 0;
+    return put_rows(fcinfo, "sc_read_xlsx", plan, data);
 }
 
 // sc_xlsx_sheets(path text) -> TABLE(sheet integer, name text)
@@ -677,4 +738,82 @@ extern "C" Datum sc_xlsx_sheets(PG_FUNCTION_ARGS) {
         json = text_to_cstring(PG_GETARG_TEXT_PP(1));
     }
     return make_xlsx(fcinfo, json, {}, {});
+}
+
+namespace {
+    // A delimiter argument: one character, or "" to find it when reading. PostgreSQL code: raises.
+    char delimiter_of(const char *text, const char *function, const bool may_be_empty) {
+        if (std::strlen(text) > 1 || (!may_be_empty && !*text))
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("%s: the delimiter is one character, not \"%s\"", function, text)));
+        return *text;
+    }
+
+    // The query's rows written as a CSV file at path, its columns' names first, then made readable by
+    // all. Never raises.
+    void write_csv(const char *path, const sheet_data &data, const char delimiter, sc_pglib::pending_error &error) noexcept {
+        try {
+            sc::office::csv::sheet out;
+            for (int c = 0; c < data.columns; ++c) out[{0, static_cast<std::size_t>(c)}] = std::string{data.headers[c]};
+            for (uint64 r = 0; r < data.rows; ++r) {
+                for (int c = 0; c < data.columns; ++c) {
+                    const auto &from = data.cells[r * data.columns + c];
+                    const sc::office::csv::address where{static_cast<std::size_t>(r + 1), static_cast<std::size_t>(c)};
+                    switch (from.is) {
+                        case kind::number:
+                            if (from.as == shown::plain) out[where] = from.number;
+                            else out[where] = serial_text(from.number, from.as != shown::time, from.as != shown::date);
+                            break;
+                        case kind::boolean: out[where] = from.flag; break;
+                        case kind::text: out[where] = std::string{from.text}; break;
+                        case kind::empty: break;
+                    }
+                }
+            }
+            sc::office::csv::write(out, path, {.delimiter = delimiter});
+            if (::chmod(path, 0644) != 0) error.set(ERRCODE_IO_ERROR, WARNING, "sc_csv: could not make \"%s\" readable by all: %m", path);
+        } catch (const std::exception &problem) {
+            error.set(ERRCODE_IO_ERROR, ERROR, "sc_csv: \"%s\": %s", path, problem.what());
+        } catch (...) {
+            error.set(ERRCODE_IO_ERROR, ERROR, "sc_csv: unexpected C++ exception");
+        }
+    }
+}
+
+// sc_csv(path text, query text, delimiter text) -> bigint
+extern "C" Datum sc_csv_query(PG_FUNCTION_ARGS) {
+    if (!has_privs_of_role(GetUserId(), ROLE_PG_WRITE_SERVER_FILES))
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("sc_csv: permission denied to write a file"),
+                        errdetail("Only roles with the privileges of the \"pg_write_server_files\" role may, as with COPY to a file.")));
+    const char *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
+    if (path[0] != '/') ereport(ERROR, (errcode(ERRCODE_INVALID_NAME), errmsg("sc_csv: the path must be absolute: \"%s\"", path)));
+    sheet_data sheet{};
+    sheet.name = "csv";
+    sheet.query = text_to_cstring(PG_GETARG_TEXT_PP(1));
+    if (std::string_view{sheet.query}.find_first_not_of(" \t\r\n") == std::string_view::npos)
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("sc_csv: the query is empty")));
+    const char delimiter = PG_NARGS() > 2 ? delimiter_of(text_to_cstring(PG_GETARG_TEXT_PP(2)), "sc_csv", false) : ',';
+
+    const MemoryContext outer = CurrentMemoryContext;
+    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("sc_csv: SPI_connect failed")));
+    run_query(sheet, outer, "sc_csv");
+    SPI_finish();
+
+    sc_pglib::pending_error error;
+    write_csv(path, sheet, delimiter, error);
+    error.raise();
+    PG_RETURN_INT64(static_cast<int64>(sheet.rows));
+}
+
+// sc_read_csv(path text, from_row integer, delimiter text) -> SETOF record
+extern "C" Datum sc_read_csv_rows(PG_FUNCTION_ARGS) {
+    const char *path = readable_path(fcinfo, "sc_read_csv");
+    const int from_row = PG_NARGS() > 1 ? PG_GETARG_INT32(1) : 1;
+    if (from_row < 1) ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("sc_read_csv: rows are numbered from 1, not %d", from_row)));
+    const char delimiter = PG_NARGS() > 2 ? delimiter_of(text_to_cstring(PG_GETARG_TEXT_PP(2)), "sc_read_csv", true) : '\0';
+    const column_plan plan = plan_columns(fcinfo, "sc_read_csv");
+    read_rows data;
+    sc_pglib::pending_error error;
+    read_csv_rows(path, delimiter, from_row, data, error);
+    error.raise();
+    return put_rows(fcinfo, "sc_read_csv", plan, data);
 }

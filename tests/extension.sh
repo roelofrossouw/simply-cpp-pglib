@@ -60,7 +60,7 @@ if [ "$major" -ge 18 ]; then
     check_extension=1
 else
     echo "PostgreSQL $major: running the extension scripts directly (CREATE EXTENSION of an uninstalled extension needs 18)"
-    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql; do
+    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql; do
         sed -e '/^\\echo/d' -e "s|MODULE_PATHNAME|$library|g" "$sql_dir/$step" | psql_run
     done
     check_extension=0
@@ -184,11 +184,38 @@ check 'one' "select * from sc_read_xlsx('$work/empty.xlsx', 1) as x(a text)"
 check "~there's no sheet \"Nope\"" "select * from sc_read_xlsx('$work/one.xlsx', 'Nope') as x(a text)"
 check "~the path must be absolute" "select sc_read_xlsx('one.xlsx')"
 check "~sc_read_xlsx: \"$work/missing.xlsx\"" "select sc_read_xlsx('$work/missing.xlsx')"
+# CSV: a query's rows with its columns' names first, read back as rows (no sheet), a delimiter
+# given or found.
+check "3" "select sc_csv('$work/one.csv', 'select n, n * 1.5 as half, n % 2 = 0 as even, date ''2026-10-30'' + n as day, ''row, '' || n as label, null::text as nothing, ''007'' as code from generate_series(1, 3) n')"
+check "644" "select '$(stat -f %Lp "$work/one.csv" 2>/dev/null || stat -c %a "$work/one.csv" 2>/dev/null)'"
+if head -2 "$work/one.csv" | tr -d '\r' | tr '\n' '|' | grep -q '^n,half,even,day,label,nothing,code|1,1.5,FALSE,2026-10-31,"row, 1",,007|$'; then
+    echo "ok: one.csv holds the header, numbers, TRUE/FALSE, an ISO date, a quoted comma, an empty field and 007"
+else
+    echo "FAILED: one.csv"; head -3 "$work/one.csv"; failures=$((failures + 1))
+fi
+check 'row, 1|row, 2|row, 3' "select string_agg(e, '|') from sc_read_csv('$work/one.csv', 2) as x(e text)"
+check '6|9.0|1|2026-11-02|007' "select sum(a), sum(b), count(*) filter (where c), max(d), min(g) from sc_read_csv('$work/one.csv', 2) as x(a int, b numeric, c boolean, d date, g text)"
+check '2|1' "select \"row\", a from sc_read_csv('$work/one.csv', 2) as x(\"row\" int, a int) where \"row\" = 2"
+check '4' "select count(*) from sc_read_csv('$work/one.csv') as x(a text)"
+check "2" "select sc_csv('$work/semi.csv', 'select 1.5 as price union all select 2.25', ';')"
+check '3.75' "select sum(a) from sc_read_csv('$work/semi.csv', 2) as x(a numeric)"
+printf 'name;price\r\nBread;12,50\r\nMilk;20,00\r\n' > "$work/european.csv"
+check 'Bread=12,50|Milk=20,00' "select string_agg(a || '=' || b, '|') from sc_read_csv('$work/european.csv', 2) as x(a text, b text)"
+check 'Bread;12' "select a from sc_read_csv('$work/european.csv', 2, ',') as x(a text) limit 1"
+check "~cell D2" "select * from sc_read_csv('$work/one.csv', 2) as x(d int)"
+check "~rows are numbered from 1" "select * from sc_read_csv('$work/one.csv', 0) as x(a text)"
+check "~the delimiter is one character" "select * from sc_read_csv('$work/one.csv', 1, ';;') as x(a text)"
+check "~the delimiter is one character" "select sc_csv('$work/x.csv', 'select 1', '')"
+check "~the path must be absolute" "select sc_csv('relative.csv', 'select 1')"
+check "~sc_csv: its query returns no rows" "select sc_csv('$work/x.csv', 'create temp table sc_pglib_c (a int)')"
+check "~sc_read_csv: \"$work/missing.csv\"" "select * from sc_read_csv('$work/missing.csv') as x(a text)"
 check "" "create role sc_pglib_writer"
 check "~permission denied to read a file" "set role sc_pglib_writer; select sc_read_xlsx('$work/one.xlsx')"
 check "~permission denied to read a file" "set role sc_pglib_writer; select * from sc_read_xlsx('$work/one.xlsx', 1) as x(a text)"
 check "~permission denied to read a file" "set role sc_pglib_writer; select * from sc_xlsx_sheets('$work/one.xlsx')"
 check "~permission denied to write a file" "set role sc_pglib_writer; select sc_xlsx('$work/x.xlsx', 'select 1')"
+check "~permission denied to read a file" "set role sc_pglib_writer; select * from sc_read_csv('$work/one.csv') as x(a text)"
+check "~permission denied to write a file" "set role sc_pglib_writer; select sc_csv('$work/x.csv', 'select 1')"
 check "f" "select '$( [ -e "$work/x.xlsx" ] && echo t || echo f)'"
 
 if [ -n "${SC_REDIS_DEMO_SERVER:-}" ]; then
@@ -296,14 +323,14 @@ else
 fi
 
 if [ "$check_extension" = 1 ]; then
-    check "sc_pglib|1.6" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.7" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "" "set client_min_messages = warning; drop extension sc_pglib cascade"
-    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_xlsx_sheets'))"
+    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_xlsx_sheets', 'sc_csv', 'sc_read_csv'))"
     # Updating from 1.0, as an existing database does.
     check "" "create extension sc_pglib version '1.0'"
     check "f" "select exists (select 1 from pg_proc where proname = 'sc_redis_get')"
     check "" "alter extension sc_pglib update"
-    check "sc_pglib|1.6" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.7" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_redis')"
     check "t" "select exists (select 1 from pg_proc where proname = 'sc_redis_hgetall')"
     check "2" "select count(*) from pg_proc where proname = 'sc_redis_sadd'"

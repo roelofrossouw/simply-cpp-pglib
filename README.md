@@ -133,6 +133,26 @@ A cell's value is a number, text or `true`/`false`; a number shown as a date or 
 - The rule is COPY's: only superusers and roles with the privileges of
   `pg_read_server_files` may, and the path is absolute.
 
+## CSV files
+
+`sc_csv` writes a query's rows as a CSV file on the database server, the columns' names first;
+`sc_read_csv` reads one back as rows, as `sc_read_xlsx` reads a sheet (a CSV file has none). The
+rules for paths and permissions are COPY's, as for `.xlsx`.
+
+```sql
+SELECT sc_csv('/var/www/data/output/result.csv', 'select * from a');          -- commas
+SELECT sc_csv('/var/www/data/output/result.csv', 'select * from a', ';');     -- semicolons
+SELECT * FROM sc_read_csv('/var/www/data/input/prices.csv', 2) AS x("row" int, a text, b numeric);
+SELECT * FROM sc_read_csv('/var/www/data/input/prices.csv', delimiter => ';') AS x(a text, b text);
+```
+
+| Function | Returns | |
+|---|---|---|
+| `sc_csv(path text, query text, delimiter text = ',')` | `bigint` | the rows written (the header aside): numbers as numbers, booleans as `TRUE`/`FALSE`, dates and times as ISO text, `NULL` as an empty field, anything else as its text, quoted when it needs to be (RFC 4180) |
+| `sc_read_csv(path text, from_row integer = 1, delimiter text = '')` | `SETOF record` | the rows from `from_row` on, empty ones left out, into a column list `AS x(a text, ...)` as `sc_read_xlsx`'s; each field as written, converted to its column's type. The delimiter is found when empty: a comma, unless semicolons fit the file better (as Excel writes CSV where the decimal separator is a comma) |
+
+Since extension 1.7.
+
 ## Redis
 
 `sc_pglib` talks to Redis (standalone or Cluster) through `sc::redis`, mainly
@@ -214,7 +234,7 @@ How it behaves:
 
 - The module (`sc_pglib.so`, or `sc_pglib.dylib` on macOS) is a PostgreSQL
   loadable module using the version-1 calling convention: `src/sc_pglib.cpp`
-  (base64), `src/sc_redis.cpp` (Redis) and `src/sc_xlsx.cpp` (Excel workbooks),
+  (base64), `src/sc_redis.cpp` (Redis) and `src/sc_xlsx.cpp` (Excel workbooks and CSV files),
   linking `sc::sc-redis` and `sc::sc-core` statically, and hiredis and
   sc-office's shared library dynamically. `src/pg_glue.h` has the rules
   for mixing C++ and PostgreSQL: C++ exceptions never reach PostgreSQL, and
@@ -222,11 +242,11 @@ How it behaves:
   because `ereport()` `longjmp()`s past destructors.
 - `sql/sc_pglib.control` and the `sql/sc_pglib--*.sql` scripts are what `CREATE
   EXTENSION` reads: `sc_pglib--1.0.sql` (base64) and the updates `1.0--1.1`
-  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`), `1.4--1.5` (`sc_read_xlsx`) and `1.5--1.6` (sheets as rows, `sc_xlsx_sheets`). They and the module install into the server's own directories
+  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`), `1.4--1.5` (`sc_read_xlsx`), `1.5--1.6` (sheets as rows, `sc_xlsx_sheets`) and `1.6--1.7` (`sc_csv`, `sc_read_csv`). They and the module install into the server's own directories
   (`pg_config --sharedir`/extension and `--pkglibdir`).
-- The extension version (`1.6`) is separate from the package version. A package
+- The extension version (`1.7`) is separate from the package version. A package
   update replaces the module in place; adding or changing SQL objects needs a new
-  extension version with an update script (`sc_pglib--1.6--1.7.sql`), after which
+  extension version with an update script (`sc_pglib--1.7--1.8.sql`), after which
   databases run `ALTER EXTENSION sc_pglib UPDATE`.
 
 ## Building
