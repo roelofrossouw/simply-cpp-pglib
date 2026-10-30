@@ -65,6 +65,32 @@ int main() {
         CHECK(field(device, "lat/deeper") == nullptr);
     }
 
+    SECTION("A statement's changes as one update's members");
+    {
+        const std::vector<change> changes{
+            {change_kind::set_node, "42/350000000000009", "", {{"lat", "-26.5"}, {"reg_nr", "\"XYZ 1 GP\""}, {"temp1", "null"}, {"gps/sat", "7"}}},
+            {change_kind::set_fields, "42/350000000000001", "", {{"online", "0"}, {"temp1", "null"}, {"/gps//sat/", "8"}}},
+            {change_kind::remove, "42/350000000000002", "", {}},
+            {change_kind::move, "43/350000000000003", "42/350000000000003", {{"online", "1"}}}};
+        std::vector<std::string> read;
+        const auto members = update_members(changes, [&](const std::string &path) {
+            read.push_back(path);
+            return json::parse(R"({"lat": -29.8, "lng": 31.0, "ignition": "on", "extra": {"kept": true}})");
+        });
+        json values = json::object();
+        for (const auto &[path, value]: members) values[path] = value;
+        CHECK_EQ(values.size(), std::size_t{7});
+        CHECK(values["42/350000000000009"] == json::parse(R"({"lat": -26.5, "reg_nr": "XYZ 1 GP", "gps": {"sat": 7}})")); // null left out
+        CHECK(values["42/350000000000001/online"] == json(0));
+        CHECK(values["42/350000000000001/temp1"].is_null()); // removes the field
+        CHECK(values["42/350000000000001/gps/sat"] == json(8));
+        CHECK(values["42/350000000000002"].is_null());
+        CHECK(values["43/350000000000003"].is_null());
+        CHECK(values["42/350000000000003"] == json::parse(R"({"lat": -29.8, "lng": 31.0, "ignition": "on", "extra": {"kept": true}, "online": 1})"));
+        CHECK(read == (std::vector<std::string>{"43/350000000000003"})); // only a move reads
+        CHECK(update_members({}, [](const std::string &) { return json(); }).empty());
+    }
+
     SECTION("Lists");
     {
         CHECK(split_list(" account_id, imei ,") == (std::vector<std::string>{"account_id", "imei"}));

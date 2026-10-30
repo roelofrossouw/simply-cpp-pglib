@@ -86,4 +86,68 @@ namespace sc_pglib::firebase_rows {
         }
         return out;
     }
+
+    namespace {
+        std::vector<std::string> segments_of(const std::string &path) {
+            std::vector<std::string> out;
+            std::size_t start = 0;
+            while (start <= path.size()) {
+                const auto slash = path.find('/', start);
+                auto segment = path.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+                if (!segment.empty()) out.push_back(std::move(segment));
+                if (slash == std::string::npos) break;
+                start = slash + 1;
+            }
+            return out;
+        }
+
+        // Sets (or, for null, removes) node's field at a '/'-separated path, making objects on the way.
+        void set_at(json &node, const std::string &path, json value) {
+            const auto segments = segments_of(path);
+            if (segments.empty()) return;
+            json *at = &node;
+            for (std::size_t i = 0; i + 1 < segments.size(); ++i) {
+                if (!(*at)[segments[i]].is_object()) (*at)[segments[i]] = json::object();
+                at = &(*at)[segments[i]];
+            }
+            if (value.is_null()) at->erase(segments.back());
+            else (*at)[segments.back()] = std::move(value);
+        }
+
+        std::string normalized(const std::string &path) {
+            std::string out;
+            for (const auto &segment: segments_of(path)) out += (out.empty() ? "" : "/") + segment;
+            return out;
+        }
+    }
+
+    std::vector<std::pair<std::string, json>> update_members(const std::vector<change> &changes,
+                                                             const std::function<json(const std::string &)> &read_node) {
+        std::vector<std::pair<std::string, json>> members;
+        for (const auto &each: changes) {
+            switch (each.kind) {
+                case change_kind::set_node: {
+                    json node = json::object();
+                    for (const auto &[field, value]: each.fields) set_at(node, field, json::parse(value));
+                    members.emplace_back(each.path, std::move(node));
+                    break;
+                }
+                case change_kind::set_fields:
+                    for (const auto &[field, value]: each.fields) members.emplace_back(each.path + "/" + normalized(field), json::parse(value));
+                    break;
+                case change_kind::remove:
+                    members.emplace_back(each.path, nullptr);
+                    break;
+                case change_kind::move: {
+                    json node = read_node(each.path);
+                    if (!node.is_object()) node = json::object();
+                    for (const auto &[field, value]: each.fields) set_at(node, field, json::parse(value));
+                    members.emplace_back(each.path, nullptr);
+                    members.emplace_back(each.to, std::move(node));
+                    break;
+                }
+            }
+        }
+        return members;
+    }
 }

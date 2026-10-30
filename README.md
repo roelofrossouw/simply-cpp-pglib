@@ -453,7 +453,7 @@ Each session keeps one client per server, so its access token (an hour's worth)
 serves every call in that time. Writes aren't transactional: they happen at once
 and stay when the transaction rolls back.
 
-### Foreign tables (read-only)
+### Foreign tables
 
 A foreign table maps a path and the key levels under it to rows: every object
 node at the last key level is a row, the keys on the way to it are its key
@@ -485,8 +485,32 @@ ones join the path (`EXPLAIN` shows it as `Firebase path: <root>/{account_id}`),
 and later ones filter the walk. Every condition is still checked by
 PostgreSQL. Otherwise the whole path is read, once per scan. An empty string is
 NULL in a column that isn't text-like, as the device records keep `""` for
-unknown numbers. Inserting, updating and deleting through a foreign table come
-later; the functions above write.
+unknown numbers.
+
+Writing goes through the same table. A statement's changes are collected and
+sent as **one multi-path update** when it ends, so they're all written or none
+are:
+
+| | |
+|---|---|
+| `INSERT` | the row's node, **replacing** one with the same keys; its non-NULL columns as fields |
+| `UPDATE` | only the columns it sets, each a field; NULL removes the field. Setting a key column **moves** the node: the old one is read (fields without a column too), the new values applied, and it's removed where it was, in the same update |
+| `DELETE` | the node |
+
+```sql
+-- the daily refresh: every device, replaced
+INSERT INTO device (account_id, imei, lat, lng, online)
+    SELECT account_id, imei, latitude, longitude, online FROM truckassist.firebase_daily_device_refresh();
+-- only what changed
+UPDATE device SET online = 0, speed = 0 WHERE account_id = '42' AND imei = '350000000000001';
+-- a device to another account (firebase_move_device)
+UPDATE device SET account_id = '43' WHERE account_id = '42' AND imei = '350000000000001';
+DELETE FROM device WHERE account_id = '42' AND imei = '350000000000002';
+```
+
+Key columns identify the rows, so a table needs `keys` to be written, and a key
+can't be NULL, empty, or hold `.` `$` `#` `[` `]` `/`. As with the functions,
+writes aren't undone when the transaction rolls back.
 
 ## How it fits together
 

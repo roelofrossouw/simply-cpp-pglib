@@ -463,8 +463,16 @@ if command -v openssl >/dev/null; then
     check "~Firebase path: devices/all" "explain (costs off) select * from fb_device where imei = '3500'"
     expect "a parameter narrows it too" "~Firebase path: devices/all/{account_id}" "$(session <<<"set plan_cache_mode = force_generic_plan; prepare p(text) as select * from fb_device where account_id = \$1; explain (costs off) execute p('42')")"
     check "~Firebase server \"fb\": sc::firebase: access token: no answer" "select * from fb_device where account_id = '42'"
+    # Writing: checked before anything is sent; then one update at the statement's end (no answer here).
+    check "~has no keys option" "create foreign table fb_nokeys (a text) server fb; update fb_nokeys set a = 'x'"
+    check "~key column \"imei\" can't be NULL" "insert into fb_device (account_id, imei, lat) values ('42', null, 1)"
+    check "~Firebase keys can't be empty or hold" "insert into fb_device (account_id, imei, lat) values ('42', 'a/b', 1)"
+    check "~Firebase path: devices/all/{account_id}" "explain (costs off) update fb_device set online = 0 where account_id = '42'"
+    check "~Firebase path: devices/all/{account_id}/{imei}" "explain (costs off) delete from fb_device where account_id = '42' and imei = '1'"
+    check "~Firebase server \"fb\": sc::firebase: access token: no answer" "insert into fb_device (account_id, imei, lat, online) values ('42', '350000000000009', -26.5, 1)"
     check "" "create foreign table fb_quiet_device (account_id text, imei text) server fb_quiet options (keys 'account_id,imei')"
     expect "on_error warning: a WARNING and no rows" "~WARNING:  Firebase server \"fb_quiet\"" "$(session <<<"select count(*) from fb_quiet_device")"
+    expect "on_error warning: an INSERT warns" "~WARNING:  Firebase server \"fb_quiet\"" "$(session <<<"insert into fb_quiet_device values ('42', '350000000000009')")"
 else
     echo "skipped: Firebase key checks (no openssl)"
 fi

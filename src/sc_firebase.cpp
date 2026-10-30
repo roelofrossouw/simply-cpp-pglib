@@ -11,7 +11,7 @@
 // With on_error 'error' (the default) a failure is an ERROR; with 'warning' it's a WARNING and the
 // call returns NULL (or false), a foreign table no rows.
 //
-// The wrapper's handler also makes foreign tables of it (read-only so far): see the end of the file.
+// The wrapper's handler also makes foreign tables of it, read and written: see the end of the file.
 
 #include <sc_firebase.h>
 
@@ -49,12 +49,15 @@ extern "C" {
 #include <foreign/fdwapi.h>
 #include <nodes/makefuncs.h>
 #include <nodes/nodeFuncs.h>
+#include <optimizer/appendinfo.h>
 #include <optimizer/clauses.h>
+#include <optimizer/inherit.h>
 #include <optimizer/optimizer.h>
 #include <optimizer/pathnode.h>
 #include <optimizer/planmain.h>
 #include <optimizer/restrictinfo.h>
 #include <utils/lsyscache.h>
+#include <utils/json.h>
 #include <utils/rel.h>
 
 PG_FUNCTION_INFO_V1(sc_firebase_fdw_handler);
@@ -378,7 +381,7 @@ extern "C" Datum sc_firebase_move(PG_FUNCTION_ARGS) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Foreign tables (read-only so far). A table maps a path under the server's root and the key
+// Foreign tables. A table maps a path under the server's root and the key
 // levels under it to rows (see firebase_rows.h):
 //
 //   CREATE FOREIGN TABLE device (account_id text, imei text, lat float8, online int, reg_nr text)
@@ -682,7 +685,297 @@ namespace {
     }
 }
 
-// sc_firebase_fdw_handler(): the callbacks that make sc_firebase's foreign tables readable.
+
+// ---------------------------------------------------------------------------------------------
+// Writing through foreign tables. A statement's changes are collected and sent as one multi-path
+// update of the table's path when it ends, so they're all written or none are:
+//   INSERT   the row's node, replacing one with the same keys (its non-NULL columns as fields)
+//   UPDATE   the columns it sets, each a field (NULL removes it); setting a key column moves the
+//            node: the old one is read, the new columns applied, and it's removed where it was
+//   DELETE   the node
+// Key columns are the row's identity, so they may not be NULL, empty, or hold . $ # [ ] /.
+
+namespace {
+    enum class op_kind { set_node, set_fields, remove, move };
+
+    // One row's change. Plain data, in the query's memory.
+    struct write_op {
+        op_kind kind = op_kind::remove;
+        char *path = nullptr;          // the row's keys joined with '/'
+        char *to = nullptr;            // move: the new keys
+        int field_count = 0;
+        char **field_paths = nullptr;  // set_node, set_fields, move: fields
+        char **field_values = nullptr; // their values as JSON
+    };
+
+    struct modify_state {
+        settings s;
+        const char *path = "";
+        char **key_names = nullptr;
+        int key_count = 0;
+        AttrNumber *key_attnums = nullptr;   // in the table
+        AttrNumber *junk_attnums = nullptr;  // the keys' row identity in the plan's output (update, delete)
+        int natts = 0;
+        int *column_key = nullptr;
+        char **column_field = nullptr;
+        Oid *column_type = nullptr;
+        bool *updated = nullptr;             // update: the columns it sets
+        write_op *ops = nullptr;
+        int op_count = 0;
+        int op_capacity = 0;
+        MemoryContext memory = nullptr;
+    };
+
+    // A row identity column's name for key level n.
+    char *junk_name(const int level) { return psprintf("sc_firebase_key%d", level); }
+
+    void firebase_update_targets(PlannerInfo *root, const Index rtindex, RangeTblEntry *, Relation relation) {
+        const Oid relid = RelationGetRelid(relation);
+        char **names = nullptr;
+        const int count = split_keys(options_of(relid).keys, &names);
+        if (count == 0) {
+            ereport(ERROR, (errcode(ERRCODE_FDW_OPTION_NAME_NOT_FOUND),
+                            errmsg("foreign table \"%s\" has no keys option, so its rows can't be told apart", RelationGetRelationName(relation))));
+        }
+        const AttrNumber *attnums = key_attnums(relid, names, count);
+        TupleDesc description = RelationGetDescr(relation);
+        for (int level = 0; level < count; ++level) {
+            Form_pg_attribute attribute = TupleDescAttr(description, attnums[level] - 1);
+            Var *var = makeVar(rtindex, attnums[level], attribute->atttypid, attribute->atttypmod, attribute->attcollation, 0);
+            add_row_identity_var(root, var, rtindex, junk_name(level));
+        }
+    }
+
+    // fdw_private: the columns an UPDATE sets (an IntList of attribute numbers); NIL otherwise.
+    List *firebase_plan_modify(PlannerInfo *root, ModifyTable *plan, const Index result_relation, int) {
+        List *updated = NIL;
+        if (plan->operation == CMD_UPDATE) {
+            Bitmapset *columns = get_rel_all_updated_cols(root, find_base_rel(root, static_cast<int>(result_relation)));
+            int member = -1;
+            while ((member = bms_next_member(columns, member)) >= 0) {
+                const AttrNumber attnum = static_cast<AttrNumber>(member + FirstLowInvalidHeapAttributeNumber);
+                if (attnum > 0) updated = lappend_int(updated, attnum);
+            }
+        }
+        return list_make1(updated);
+    }
+
+    void firebase_begin_modify(ModifyTableState *mtstate, ResultRelInfo *info, List *fdw_private, int, const int eflags) {
+        if (eflags & EXEC_FLAG_EXPLAIN_ONLY) return;
+        Relation relation = info->ri_RelationDesc;
+        const Oid relid = RelationGetRelid(relation);
+        EState *estate = mtstate->ps.state;
+        const MemoryContext previous = MemoryContextSwitchTo(estate->es_query_cxt);
+        auto *state = static_cast<modify_state *>(palloc0(sizeof(modify_state)));
+        state->memory = estate->es_query_cxt;
+        state->s = settings_for_server(GetForeignServer(GetForeignTable(relid)->serverid));
+        const table_options t = options_of(relid);
+        state->path = t.path;
+        state->key_count = split_keys(t.keys, &state->key_names);
+        state->key_attnums = key_attnums(relid, state->key_names, state->key_count);
+        TupleDesc description = RelationGetDescr(relation);
+        state->natts = description->natts;
+        const int n = state->natts + 1;
+        state->column_key = static_cast<int *>(palloc(sizeof(int) * n));
+        state->column_field = static_cast<char **>(palloc0(sizeof(char *) * n));
+        state->column_type = static_cast<Oid *>(palloc0(sizeof(Oid) * n));
+        state->updated = static_cast<bool *>(palloc0(sizeof(bool) * n));
+        for (int i = 0; i < state->natts; ++i) {
+            Form_pg_attribute attribute = TupleDescAttr(description, i);
+            state->column_key[i] = -1;
+            if (attribute->attisdropped) continue;
+            for (int level = 0; level < state->key_count; ++level)
+                if (state->key_attnums[level] == attribute->attnum) state->column_key[i] = level;
+            state->column_type[i] = attribute->atttypid;
+            state->column_field[i] = pstrdup(NameStr(attribute->attname));
+            ListCell *cell;
+            foreach(cell, GetForeignColumnOptions(relid, attribute->attnum)) {
+                auto *option = static_cast<DefElem *>(lfirst(cell));
+                if (std::strcmp(option->defname, "field") == 0) state->column_field[i] = defGetString(option);
+            }
+        }
+        ListCell *cell;
+        foreach(cell, static_cast<List *>(linitial(fdw_private))) state->updated[lfirst_int(cell) - 1] = true;
+        const CmdType operation = mtstate->operation;
+        if (operation == CMD_UPDATE || operation == CMD_DELETE) {
+            Plan *subplan = outerPlanState(mtstate)->plan;
+            state->junk_attnums = static_cast<AttrNumber *>(palloc(sizeof(AttrNumber) * (state->key_count + 1)));
+            for (int level = 0; level < state->key_count; ++level) {
+                state->junk_attnums[level] = ExecFindJunkAttributeInTlist(subplan->targetlist, junk_name(level));
+                if (!AttributeNumberIsValid(state->junk_attnums[level]))
+                    ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), errmsg("sc_firebase: key %d missing from the plan", level)));
+            }
+        }
+        info->ri_FdwState = state;
+        MemoryContextSwitchTo(previous);
+    }
+
+    // A key's text, checked: Firebase keys can't be empty or hold . $ # [ ] / (or be NULL here).
+    char *key_text(const modify_state *state, const int level, const Datum value, const bool is_null, const Oid type) {
+        if (is_null) {
+            ereport(ERROR, (errcode(ERRCODE_NOT_NULL_VIOLATION), errmsg("key column \"%s\" can't be NULL", state->key_names[level])));
+        }
+        Oid output = InvalidOid;
+        bool varlena = false;
+        getTypeOutputInfo(type, &output, &varlena);
+        char *text = OidOutputFunctionCall(output, value);
+        if (!*text || std::strpbrk(text, ".$#[]/")) {
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                            errmsg("key column \"%s\" holds \"%s\": Firebase keys can't be empty or hold . $ # [ ] /", state->key_names[level], text)));
+        }
+        return text;
+    }
+
+    // A value as JSON: numbers and booleans as such, json and jsonb as they are, the rest as strings.
+    char *json_of(const Datum value, const bool is_null, const Oid type) {
+        if (is_null) return pstrdup("null");
+        Oid output = InvalidOid;
+        bool varlena = false;
+        getTypeOutputInfo(type, &output, &varlena);
+        char *text = OidOutputFunctionCall(output, value);
+        if (type == JSONOID || type == JSONBOID) return text;
+        if (type == BOOLOID) return pstrdup(DatumGetBool(value) ? "true" : "false");
+        char category = 0;
+        bool preferred = false;
+        get_type_category_preferred(type, &category, &preferred);
+        const bool finite = std::strcmp(text, "NaN") != 0 && std::strstr(text, "Infinity") == nullptr;
+        if (category == TYPCATEGORY_NUMERIC && finite) return text;
+        StringInfoData quoted;
+        initStringInfo(&quoted);
+        escape_json(&quoted, text);
+        return quoted.data;
+    }
+
+    write_op &new_op(modify_state *state) {
+        if (state->op_count == state->op_capacity) {
+            state->op_capacity = state->op_capacity ? state->op_capacity * 2 : 16;
+            const auto size = sizeof(write_op) * static_cast<std::size_t>(state->op_capacity);
+            state->ops = static_cast<write_op *>(state->ops ? repalloc(state->ops, size) : palloc(size));
+        }
+        write_op &op = state->ops[state->op_count++];
+        op = write_op{};
+        return op;
+    }
+
+    char *joined(const modify_state *state, char **keys) {
+        StringInfoData path;
+        initStringInfo(&path);
+        for (int level = 0; level < state->key_count; ++level) appendStringInfo(&path, "%s%s", level ? "/" : "", keys[level]);
+        return path.data;
+    }
+
+    // The columns of slot that aren't keys (and, when only_updated, that the UPDATE sets) as fields of op.
+    void add_fields(modify_state *state, write_op &op, TupleTableSlot *slot, const bool only_updated, const bool skip_null) {
+        slot_getallattrs(slot);
+        op.field_paths = static_cast<char **>(palloc(sizeof(char *) * (state->natts + 1)));
+        op.field_values = static_cast<char **>(palloc(sizeof(char *) * (state->natts + 1)));
+        for (int c = 0; c < state->natts; ++c) {
+            if (state->column_key[c] >= 0 || !state->column_field[c]) continue;
+            if (only_updated && !state->updated[c]) continue;
+            if (skip_null && slot->tts_isnull[c]) continue;
+            op.field_paths[op.field_count] = state->column_field[c];
+            op.field_values[op.field_count++] = json_of(slot->tts_values[c], slot->tts_isnull[c], state->column_type[c]);
+        }
+    }
+
+    TupleTableSlot *firebase_insert(EState *estate, ResultRelInfo *info, TupleTableSlot *slot, TupleTableSlot *) {
+        auto *state = static_cast<modify_state *>(info->ri_FdwState);
+        const MemoryContext previous = MemoryContextSwitchTo(estate->es_query_cxt);
+        slot_getallattrs(slot);
+        auto **keys = static_cast<char **>(palloc(sizeof(char *) * (state->key_count + 1)));
+        for (int level = 0; level < state->key_count; ++level) {
+            const int c = state->key_attnums[level] - 1;
+            keys[level] = key_text(state, level, slot->tts_values[c], slot->tts_isnull[c], state->column_type[c]);
+        }
+        write_op &op = new_op(state);
+        op.kind = op_kind::set_node;
+        op.path = joined(state, keys);
+        add_fields(state, op, slot, false, true);
+        MemoryContextSwitchTo(previous);
+        return slot;
+    }
+
+    // The row's current keys, from the plan's row identity columns.
+    char **old_keys(modify_state *state, ResultRelInfo *info, TupleTableSlot *plan_slot) {
+        auto **keys = static_cast<char **>(palloc(sizeof(char *) * (state->key_count + 1)));
+        TupleDesc description = RelationGetDescr(info->ri_RelationDesc);
+        for (int level = 0; level < state->key_count; ++level) {
+            bool is_null = false;
+            const Datum value = ExecGetJunkAttribute(plan_slot, state->junk_attnums[level], &is_null);
+            keys[level] = key_text(state, level, value, is_null, TupleDescAttr(description, state->key_attnums[level] - 1)->atttypid);
+        }
+        return keys;
+    }
+
+    TupleTableSlot *firebase_update(EState *estate, ResultRelInfo *info, TupleTableSlot *slot, TupleTableSlot *plan_slot) {
+        auto *state = static_cast<modify_state *>(info->ri_FdwState);
+        const MemoryContext previous = MemoryContextSwitchTo(estate->es_query_cxt);
+        char **keys = old_keys(state, info, plan_slot);
+        slot_getallattrs(slot);
+        // A key column set to another value moves the node.
+        auto **new_keys = static_cast<char **>(palloc(sizeof(char *) * (state->key_count + 1)));
+        bool moved = false;
+        for (int level = 0; level < state->key_count; ++level) {
+            const int c = state->key_attnums[level] - 1;
+            new_keys[level] = keys[level];
+            if (!state->updated[c]) continue;
+            new_keys[level] = key_text(state, level, slot->tts_values[c], slot->tts_isnull[c], state->column_type[c]);
+            moved = moved || std::strcmp(new_keys[level], keys[level]) != 0;
+        }
+        write_op &op = new_op(state);
+        op.kind = moved ? op_kind::move : op_kind::set_fields;
+        op.path = joined(state, keys);
+        if (moved) op.to = joined(state, new_keys);
+        add_fields(state, op, slot, true, false);
+        MemoryContextSwitchTo(previous);
+        return slot;
+    }
+
+    TupleTableSlot *firebase_delete(EState *estate, ResultRelInfo *info, TupleTableSlot *slot, TupleTableSlot *plan_slot) {
+        auto *state = static_cast<modify_state *>(info->ri_FdwState);
+        const MemoryContext previous = MemoryContextSwitchTo(estate->es_query_cxt);
+        write_op &op = new_op(state);
+        op.kind = op_kind::remove;
+        op.path = joined(state, old_keys(state, info, plan_slot));
+        MemoryContextSwitchTo(previous);
+        return slot;
+    }
+
+    // Sends the statement's changes as one update of the table's path.
+    void firebase_end_modify(EState *, ResultRelInfo *info) {
+        auto *state = static_cast<modify_state *>(info->ri_FdwState);
+        if (!state || state->op_count == 0) return;
+        const outcome result = run(state->s, [state](const sc::firebase::database &db, outcome &) {
+            namespace rows = sc_pglib::firebase_rows;
+            const auto base = full_path(state->s, state->path);
+            std::vector<rows::change> changes;
+            changes.reserve(static_cast<std::size_t>(state->op_count));
+            for (int i = 0; i < state->op_count; ++i) {
+                const write_op &op = state->ops[i];
+                rows::change each;
+                each.kind = op.kind == op_kind::set_node ? rows::change_kind::set_node
+                            : op.kind == op_kind::set_fields ? rows::change_kind::set_fields
+                            : op.kind == op_kind::move ? rows::change_kind::move
+                                                       : rows::change_kind::remove;
+                each.path = op.path;
+                if (op.to) each.to = op.to;
+                for (int f = 0; f < op.field_count; ++f) each.fields.emplace_back(op.field_paths[f], op.field_values[f]);
+                changes.push_back(std::move(each));
+            }
+            sc::firebase::json values = sc::firebase::json::object();
+            for (auto &[path, value]: rows::update_members(changes, [&](const std::string &path) { return db.get(base + "/" + path); }))
+                values[path] = std::move(value);
+            db.update(base, values);
+        });
+        result.error.raise();
+    }
+
+    int firebase_updatable(Relation) {
+        return (1 << CMD_INSERT) | (1 << CMD_UPDATE) | (1 << CMD_DELETE);
+    }
+}
+
+// sc_firebase_fdw_handler(): the callbacks that make sc_firebase's foreign tables readable and writable.
 extern "C" Datum sc_firebase_fdw_handler(PG_FUNCTION_ARGS) {
     FdwRoutine *routine = makeNode(FdwRoutine);
     routine->GetForeignRelSize = firebase_rel_size;
@@ -693,5 +986,13 @@ extern "C" Datum sc_firebase_fdw_handler(PG_FUNCTION_ARGS) {
     routine->ReScanForeignScan = firebase_rescan;
     routine->EndForeignScan = firebase_end;
     routine->ExplainForeignScan = firebase_explain;
+    routine->AddForeignUpdateTargets = firebase_update_targets;
+    routine->PlanForeignModify = firebase_plan_modify;
+    routine->BeginForeignModify = firebase_begin_modify;
+    routine->ExecForeignInsert = firebase_insert;
+    routine->ExecForeignUpdate = firebase_update;
+    routine->ExecForeignDelete = firebase_delete;
+    routine->EndForeignModify = firebase_end_modify;
+    routine->IsForeignRelUpdatable = firebase_updatable;
     PG_RETURN_POINTER(routine);
 }

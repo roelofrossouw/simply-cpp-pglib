@@ -9,6 +9,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -40,6 +41,23 @@ namespace sc_pglib::firebase_rows {
     // A value as a column's text: a string as it is, a number or boolean as JSON writes it, an
     // object or array as JSON; nullopt for null. as_json: always JSON (for json and jsonb columns).
     std::optional<std::string> text_of(const json &value, bool as_json);
+
+    // A row's change through a foreign table, for one statement's update.
+    enum class change_kind { set_node, set_fields, remove, move };
+    struct change {
+        change_kind kind = change_kind::remove;
+        std::string path; // the row's keys joined with '/'
+        std::string to;   // move: the new keys
+        std::vector<std::pair<std::string, std::string>> fields; // field (a name or path) -> its value as JSON
+    };
+
+    // The statement's changes as the members of one multi-path update of the table's path:
+    //   set_node    path -> an object of the fields (null ones left out; a path builds nesting)
+    //   set_fields  path/field -> each value (null removes the field)
+    //   remove      path -> null
+    //   move        path -> null, to -> the node read_node(path) gives, with the fields applied
+    std::vector<std::pair<std::string, json>> update_members(const std::vector<change> &changes,
+                                                             const std::function<json(const std::string &)> &read_node);
 
     // "a, b" -> {"a", "b"}: a comma-separated list, trimmed, empty items dropped.
     std::vector<std::string> split_list(const std::string &list);
