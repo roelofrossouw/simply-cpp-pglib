@@ -148,6 +148,10 @@ SELECT * FROM sc_read_csv('/var/www/data/input/prices.csv', delimiter => ';') AS
 -- The same CSV in a ZIP archive (its one entry: result.csv here), and one read from an archive
 SELECT sc_csvzip('/var/www/data/output/result.zip', 'select * from a');
 SELECT * FROM sc_read_csvzip('/var/www/data/input/prices.zip', 'prices.csv', 2) AS x(a text, b numeric);
+
+-- Several CSV files in one archive, a query each (json keeps their order, jsonb sorts them)
+SELECT sc_csvzip('/var/www/data/output/export.zip',
+                 '{"items.csv": "select * from items", "reports/prices.csv": "select * from prices"}'::json);
 ```
 
 | Function | Returns | |
@@ -155,6 +159,7 @@ SELECT * FROM sc_read_csvzip('/var/www/data/input/prices.zip', 'prices.csv', 2) 
 | `sc_csv(path text, query text, delimiter text = ',')` | `bigint` | the rows written (the header aside): numbers as numbers, booleans as `TRUE`/`FALSE`, dates and times as ISO text, `NULL` as an empty field, anything else as its text, quoted when it needs to be (RFC 4180) |
 | `sc_read_csv(path text, from_row integer = 1, delimiter text = '')` | `SETOF record` | the rows from `from_row` on, empty ones left out, into a column list `AS x(a text, ...)` as `sc_read_xlsx`'s; each field as written, converted to its column's type. The delimiter is found when empty: a comma, unless semicolons fit the file better (as Excel writes CSV where the decimal separator is a comma) |
 | `sc_csvzip(path text, query text, entry text = '', delimiter text = ',')` | `bigint` | `sc_csv`'s file as the one entry of a ZIP archive at `path` (deflated, an existing one replaced): `entry`, or the archive's name with `.csv` |
+| `sc_csvzip(path text, files json or jsonb, delimiter text = ',')` | `bigint` | a CSV file per query, as `sc_xlsx` makes a sheet per query: `{"name.csv": "query", ...}`, names relative paths (`/` between folders); the rows of all files together. Give the files as `json` or `jsonb` explicitly: an untyped string is taken as a query |
 | `sc_read_csvzip(path text, entry text, from_row integer = 1, delimiter text = '')` | `SETOF record` | that entry of a ZIP archive read as `sc_read_csv` reads a file; an error naming the entries when there's no such one |
 
 Since extension 1.7.
@@ -274,11 +279,11 @@ How it behaves:
   because `ereport()` `longjmp()`s past destructors.
 - `sql/sc_pglib.control` and the `sql/sc_pglib--*.sql` scripts are what `CREATE
   EXTENSION` reads: `sc_pglib--1.0.sql` (base64) and the updates `1.0--1.1`
-  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`), `1.4--1.5` (`sc_read_xlsx`), `1.5--1.6` (sheets as rows, `sc_xlsx_sheets`) `1.6--1.7` (`sc_csv`, `sc_read_csv`), `1.7--1.8` (`sc_mkdir`) and `1.8--1.9` (`sc_csvzip`, `sc_read_csvzip`). They and the module install into the server's own directories
+  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`), `1.4--1.5` (`sc_read_xlsx`), `1.5--1.6` (sheets as rows, `sc_xlsx_sheets`) `1.6--1.7` (`sc_csv`, `sc_read_csv`), `1.7--1.8` (`sc_mkdir`), `1.8--1.9` (`sc_csvzip`, `sc_read_csvzip`) and `1.9--1.10` (`sc_csvzip` with several files). They and the module install into the server's own directories
   (`pg_config --sharedir`/extension and `--pkglibdir`).
-- The extension version (`1.9`) is separate from the package version. A package
+- The extension version (`1.10`) is separate from the package version. A package
   update replaces the module in place; adding or changing SQL objects needs a new
-  extension version with an update script (`sc_pglib--1.9--1.10.sql`), after which
+  extension version with an update script (`sc_pglib--1.10--1.11.sql`), after which
   databases run `ALTER EXTENSION sc_pglib UPDATE`.
 
 ## Building
