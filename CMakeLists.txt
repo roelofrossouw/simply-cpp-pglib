@@ -21,6 +21,7 @@ message(STATUS "SimplyCPP ${SC_MODULE} Version: ${SC_VERSION}")
 ################
 find_or_install_package(sc-core simply-cpp-dev simply-cpp 1.20.0)
 find_or_install_package(sc-redis simply-cpp-redis-dev simply-cpp-redis 1.3.0)
+find_or_install_package(sc-office simply-cpp-office-dev simply-cpp-office 1.9.0)
 
 ## PostgreSQL server ##
 # An extension is built for one PostgreSQL major version. Each Ubuntu release builds for a fixed
@@ -92,10 +93,13 @@ message(STATUS "Building for ${SC_PGLIB_PG_VERSION} (${SC_PGLIB_PG_CONFIG})")
 # A module PostgreSQL loads with dlopen(), so no "lib" prefix and no link against the server:
 # its symbols resolve at load time. macOS needs that said explicitly, and PostgreSQL 16 and
 # later look for ".dylib" there.
-add_library(sc_pglib MODULE src/sc_pglib.cpp src/sc_redis.cpp)
+add_library(sc_pglib MODULE src/sc_pglib.cpp src/sc_redis.cpp src/sc_xlsx.cpp)
 target_include_directories(sc_pglib PRIVATE "${SC_PGLIB_PG_INCLUDEDIR}")
 # sc::sc-redis brings sc::sc-core (base64) with it.
 target_link_libraries(sc_pglib PRIVATE sc::sc-redis)
+# sc-office's shared library (its zip and XML underneath come with it), as sc-phplib links it.
+target_link_libraries(sc_pglib PRIVATE $<TARGET_LINKER_FILE:sc::sc-office-shared>)
+target_include_directories(sc_pglib PRIVATE $<TARGET_PROPERTY:sc::sc-office-shared,INTERFACE_INCLUDE_DIRECTORIES>)
 set_target_properties(sc_pglib PROPERTIES PREFIX "")
 if (APPLE)
     target_link_options(sc_pglib PRIVATE -undefined dynamic_lookup)
@@ -104,7 +108,7 @@ if (APPLE)
     endif ()
 endif ()
 
-set(SC_PGLIB_EXTENSION_FILES sql/sc_pglib.control sql/sc_pglib--1.0.sql sql/sc_pglib--1.0--1.1.sql sql/sc_pglib--1.1--1.2.sql sql/sc_pglib--1.2--1.3.sql)
+set(SC_PGLIB_EXTENSION_FILES sql/sc_pglib.control sql/sc_pglib--1.0.sql sql/sc_pglib--1.0--1.1.sql sql/sc_pglib--1.1--1.2.sql sql/sc_pglib--1.2--1.3.sql sql/sc_pglib--1.3--1.4.sql)
 if (SC_PGLIB_INSTALL)
     install(TARGETS sc_pglib LIBRARY DESTINATION "${SC_PGLIB_PG_PKGLIBDIR}" COMPONENT runtime)
     install(FILES ${SC_PGLIB_EXTENSION_FILES} DESTINATION "${SC_PGLIB_PG_SHAREDIR}/extension" COMPONENT runtime)
@@ -126,4 +130,4 @@ endif ()
 #############
 # Packaging #
 #############
-package_sc_module(DEPENDS "postgresql-${SC_PGLIB_PG_MAJOR}")
+package_sc_module(DEPENDS "postgresql-${SC_PGLIB_PG_MAJOR}" "simply-cpp-office (>= 1.9.0~)")

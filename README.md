@@ -55,6 +55,44 @@ The base64 functions wrap `sc::base64`:
 All are `IMMUTABLE STRICT PARALLEL SAFE`: a `NULL` argument gives `NULL`.
 `DROP EXTENSION sc_pglib` removes them again.
 
+## Excel workbooks
+
+`sc_xlsx` writes queries' rows as an `.xlsx` file on the database server
+(`sc::office::excel`), as `COPY ... TO 'file'` writes a CSV one, and returns how
+many rows it wrote:
+
+```sql
+SELECT sc_xlsx('/var/www/data/output/result.xlsx', 'select * from a');             -- the sheet "Sheet1"
+SELECT sc_xlsx('/var/www/data/output/result.xlsx', 'select * from a', 'Results');  -- named
+SELECT sc_xlsx('/var/www/data/output/result.xlsx',
+               '{"Subscriptions": "select * from a", "Totals": "select * from b"}'::json);
+```
+
+| Function | Returns | Notes |
+|---|---|---|
+| `sc_xlsx(path text, query text)` | `bigint` | one sheet, "Sheet1" |
+| `sc_xlsx(path text, query text, sheet text)` | `bigint` | one sheet, named |
+| `sc_xlsx(path text, sheets json)` | `bigint` | a sheet per query, in the order written |
+| `sc_xlsx(path text, sheets jsonb)` | `bigint` | the same; jsonb sorts its keys (shorter first) |
+
+- The rule is COPY's: only superusers and roles with the privileges of
+  `pg_write_server_files` may, and the path is absolute. The file is written as
+  the server's operating system user (replacing one that's there) and made
+  readable by all (0644), as PostgreSQL's own files aren't.
+- Each sheet has the columns' names in a bold first row that stays in view
+  (frozen), then a row per row. Numbers (integers, `float`, `numeric`, `oid`) are
+  numbers, booleans booleans; `date`, `timestamp`, `timestamptz` (in the
+  session's time zone) and `time` are Excel dates and times shown as
+  `yyyy-mm-dd`, `yyyy-mm-dd hh:mm:ss` and `hh:mm:ss`; `NULL` is an empty cell;
+  anything else is its text. Columns are as wide as their contents (8 to 80
+  characters).
+- A sheet name is checked as Excel does (1 to 31 characters, none of `: \ / ?
+  * [ ]`); a query that returns no rows set (not a `SELECT`), or fails, is an
+  error, and no file is written.
+- Give the sheets as `json` or `jsonb` explicitly: an untyped string is taken
+  as a query.
+- The rows are held in memory until the file is written.
+
 ## Redis
 
 `sc_pglib` talks to Redis (standalone or Cluster) through `sc::redis`, mainly
@@ -136,18 +174,19 @@ How it behaves:
 
 - The module (`sc_pglib.so`, or `sc_pglib.dylib` on macOS) is a PostgreSQL
   loadable module using the version-1 calling convention: `src/sc_pglib.cpp`
-  (base64) and `src/sc_redis.cpp` (Redis), linking `sc::sc-redis` and
-  `sc::sc-core` statically and hiredis dynamically. `src/pg_glue.h` has the rules
+  (base64), `src/sc_redis.cpp` (Redis) and `src/sc_xlsx.cpp` (Excel workbooks),
+  linking `sc::sc-redis` and `sc::sc-core` statically, and hiredis and
+  sc-office's shared library dynamically. `src/pg_glue.h` has the rules
   for mixing C++ and PostgreSQL: C++ exceptions never reach PostgreSQL, and
   nothing that can raise a PostgreSQL error runs while a C++ object is alive,
   because `ereport()` `longjmp()`s past destructors.
 - `sql/sc_pglib.control` and the `sql/sc_pglib--*.sql` scripts are what `CREATE
   EXTENSION` reads: `sc_pglib--1.0.sql` (base64) and the updates `1.0--1.1`
-  (Redis), `1.1--1.2` (`hmget`, `hgetall`) and `1.2--1.3` (sets). They and the module install into the server's own directories
+  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets) and `1.3--1.4` (`sc_xlsx`). They and the module install into the server's own directories
   (`pg_config --sharedir`/extension and `--pkglibdir`).
-- The extension version (`1.3`) is separate from the package version. A package
+- The extension version (`1.4`) is separate from the package version. A package
   update replaces the module in place; adding or changing SQL objects needs a new
-  extension version with an update script (`sc_pglib--1.3--1.4.sql`), after which
+  extension version with an update script (`sc_pglib--1.4--1.5.sql`), after which
   databases run `ALTER EXTENSION sc_pglib UPDATE`.
 
 ## Building

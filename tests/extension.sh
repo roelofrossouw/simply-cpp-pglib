@@ -60,7 +60,7 @@ if [ "$major" -ge 18 ]; then
     check_extension=1
 else
     echo "PostgreSQL $major: running the extension scripts directly (CREATE EXTENSION of an uninstalled extension needs 18)"
-    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql; do
+    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql; do
         sed -e '/^\\echo/d' -e "s|MODULE_PATHNAME|$library|g" "$sql_dir/$step" | psql_run
     done
     check_extension=0
@@ -137,6 +137,31 @@ expect "unreachable server: false, false, NULL, then skipped quickly" "f f t t" 
 check "~ERROR:  Redis server \"strict\" is unavailable" "create server strict foreign data wrapper sc_redis options (servers '10.255.255.1:6379', connect_timeout_ms '200', on_error 'error'); select sc_redis_get('strict', 'a')"
 check "~fields must not contain NULL" "select sc_redis_hmget('nowhere', 'key', array['a', null])"
 check "~permission denied for foreign server nowhere" "create role sc_pglib_tester; set role sc_pglib_tester; select sc_redis_get('nowhere', 'a')"
+
+# Excel workbooks: written by the server into the work directory.
+sheet_xml() { unzip -p "$1" "xl/worksheets/sheet$2.xml"; }
+check "3" "select sc_xlsx('$work/one.xlsx', 'select n, n * 1.5 as half, n % 2 = 0 as even, date ''2026-10-30'' + n as day, ''row '' || n as label, null::text as nothing from generate_series(1, 3) n')"
+check "644" "select '$(stat -f %Lp "$work/one.xlsx" 2>/dev/null || stat -c %a "$work/one.xlsx" 2>/dev/null)'"
+if sheet_xml "$work/one.xlsx" 1 | grep -q '>label</t></is>' && sheet_xml "$work/one.xlsx" 1 | grep -q '<c r="D2" s="2"><v>46326</v>' &&
+   sheet_xml "$work/one.xlsx" 1 | grep -q '>row 3</t></is>' && sheet_xml "$work/one.xlsx" 1 | grep -q 'ySplit="1"'; then
+    echo "ok: one.xlsx holds the header, a date as 46326 (2026-10-31), the text and the frozen header"
+else
+    echo "FAILED: one.xlsx's sheet"; sheet_xml "$work/one.xlsx" 1 | head -c 2000; echo; failures=$((failures + 1))
+fi
+check "2" "select sc_xlsx('$work/named.xlsx', 'select 1 union all select 2', 'Numbers')"
+unzip -p "$work/named.xlsx" xl/workbook.xml | grep -q 'name="Numbers"' && echo "ok: the sheet is named Numbers" || { echo "FAILED: named.xlsx's sheet name"; failures=$((failures + 1)); }
+check "5" "select sc_xlsx('$work/two.xlsx', '{\"Zeta\": \"select 1\", \"Alpha\": \"select g from generate_series(1, 4) g\"}'::json)"
+unzip -p "$work/two.xlsx" xl/workbook.xml | grep -o 'sheet name="[A-Za-z]*"' | tr '\n' ' ' | grep -q 'Zeta.*Alpha' && echo "ok: json keeps the sheets' order" || { echo "FAILED: two.xlsx's order"; failures=$((failures + 1)); }
+check "5" "select sc_xlsx('$work/three.xlsx', '{\"Zeta\": \"select 1\", \"Alpha\": \"select g from generate_series(1, 4) g\"}'::jsonb)"
+check "0" "select sc_xlsx('$work/empty.xlsx', 'select 1 as one where false')"
+check "~the path must be absolute" "select sc_xlsx('relative.xlsx', 'select 1')"
+check "~isn't a SELECT" "select sc_xlsx('$work/x.xlsx', 'create temp table sc_pglib_t (a int)')"
+check "~sheet" "select sc_xlsx('$work/x.xlsx', 'select 1', 'bad/name')"
+check "~its query isn't text" "select sc_xlsx('$work/x.xlsx', '{\"A\": 1}'::jsonb)"
+check "~relation \"no_such_table\" does not exist" "select sc_xlsx('$work/x.xlsx', 'select * from no_such_table')"
+check "" "create role sc_pglib_writer"
+check "~permission denied to write a file" "set role sc_pglib_writer; select sc_xlsx('$work/x.xlsx', 'select 1')"
+check "f" "select '$( [ -e "$work/x.xlsx" ] && echo t || echo f)'"
 
 if [ -n "${SC_REDIS_DEMO_SERVER:-}" ]; then
     prefix="sc-tmp:sc-pglib-test:$$"
@@ -243,17 +268,18 @@ else
 fi
 
 if [ "$check_extension" = 1 ]; then
-    check "sc_pglib|1.3" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.4" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "" "set client_min_messages = warning; drop extension sc_pglib cascade"
-    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%')"
+    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname = 'sc_xlsx')"
     # Updating from 1.0, as an existing database does.
     check "" "create extension sc_pglib version '1.0'"
     check "f" "select exists (select 1 from pg_proc where proname = 'sc_redis_get')"
     check "" "alter extension sc_pglib update"
-    check "sc_pglib|1.3" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.4" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_redis')"
     check "t" "select exists (select 1 from pg_proc where proname = 'sc_redis_hgetall')"
     check "2" "select count(*) from pg_proc where proname = 'sc_redis_sadd'"
+    check "4" "select count(*) from pg_proc where proname = 'sc_xlsx'"
 fi
 
 if [ "$failures" -ne 0 ]; then
