@@ -9,8 +9,11 @@ CREATE FUNCTION sc_read_csv(path text, from_row integer DEFAULT 1, delimiter tex
     AS 'MODULE_PATHNAME', 'sc_read_csv_rows'
     LANGUAGE C STRICT VOLATILE;
 
+-- sc_read_csvzip's entry may be a shell pattern ('CodesAndDescriptionsFull*.csv': * and ?, against
+-- the entry's file name when it has no '/'), or '' for the archive's only .csv entry; exactly one
+-- must match.
 DROP FUNCTION sc_read_csvzip(text, text, integer, text);
-CREATE FUNCTION sc_read_csvzip(path text, entry text, from_row integer DEFAULT 1, delimiter text DEFAULT '', encoding text DEFAULT '') RETURNS SETOF record
+CREATE FUNCTION sc_read_csvzip(path text, entry text DEFAULT '', from_row integer DEFAULT 1, delimiter text DEFAULT '', encoding text DEFAULT '') RETURNS SETOF record
     AS 'MODULE_PATHNAME', 'sc_read_csvzip_rows'
     LANGUAGE C STRICT VOLATILE;
 

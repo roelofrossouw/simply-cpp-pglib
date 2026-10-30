@@ -298,6 +298,16 @@ check "f" "select sc_remove_log('old.csv')"
 [ ! -e "$work/data/log/old.csv" ] && echo "ok: old.csv is gone" || { echo "FAILED: old.csv is still there"; failures=$((failures + 1)); }
 check "~isn't a file name in the log folder" "select sc_remove_log('../postgresql.conf')"
 check "~isn't a file name in the log folder" "select sc_remove_log('..')"
+# An entry by pattern, or '' for the only .csv one
+check "3" "select sc_csvzip('$work/efile.zip', '{\"data/CodesAndDescriptionsFull20261030.csv\": \"select ''codes'' as a\", \"OptionName20261030.csv\": \"select ''options'' as a\", \"readme.txt\": \"select ''text'' as a\"}'::json)"
+check "codes" "select a from sc_read_csvzip('$work/efile.zip', 'CodesAndDescriptionsFull*.csv', 2) as x(a text)"
+check "options" "select a from sc_read_csvzip('$work/efile.zip', 'Option?ame*', 2) as x(a text)"
+check "~more than one entry is \"*.csv\" (it has data/CodesAndDescriptionsFull20261030.csv, OptionName20261030.csv, readme.txt)" "select * from sc_read_csvzip('$work/efile.zip', '*.csv') as x(a text)"
+check "~there's no \"Nope*\" in it" "select * from sc_read_csvzip('$work/efile.zip', 'Nope*') as x(a text)"
+check "~more than one entry is a .csv entry" "select * from sc_read_csvzip('$work/efile.zip', '') as x(a text)"
+check "2" "select sc_csvzip('$work/fuel.zip', '{\"cards.CSV\": \"select 1 as one\", \"notes.txt\": \"select 2 as two\"}'::json)"
+check "1" "select a from sc_read_csvzip('$work/fuel.zip', from_row => 2) as x(a text)"
+check "1" "select a from sc_read_csvzip('$work/fuel.zip', '', 2) as x(a text)"
 check "" "create role sc_pglib_writer"
 # sc_mkdir: only under /var/www/data/output (its making is tested by test-folders), revoked from PUBLIC
 check "~isn't /var/www/data/output or a folder in it" "select sc_mkdir('$work/x')"

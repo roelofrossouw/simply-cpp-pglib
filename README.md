@@ -264,6 +264,8 @@ SELECT * FROM sc_read_csv('/var/www/data/input/prices.csv', delimiter => ';') AS
 -- The same CSV in a ZIP archive (its one entry: result.csv here), and one read from an archive
 SELECT sc_csvzip('/var/www/data/output/result.zip', 'select * from a');
 SELECT * FROM sc_read_csvzip('/var/www/data/input/prices.zip', 'prices.csv', 2) AS x(a text, b numeric);
+SELECT * FROM sc_read_csvzip('/var/www/data/input/efile.zip', 'Codes*.csv', 2) AS x(a text, b text);  -- a pattern
+SELECT * FROM sc_read_csvzip('/var/www/data/input/cards.zip') AS x(a text, b text);  -- its only .csv
 
 -- Several CSV files in one archive, a query each (json keeps their order, jsonb sorts them)
 SELECT sc_csvzip('/var/www/data/output/export.zip',
@@ -281,7 +283,7 @@ SELECT sc_csvzip('/var/www/data/output/dump.zip', 'select * from more', 'more.cs
 | `sc_read_csv(path text, from_row integer = 1, delimiter text = '', encoding text = '')` | `SETOF record` | the rows from `from_row` on, empty ones left out, into a column list `AS x(a text, ...)` as `sc_read_xlsx`'s; each field as written, converted to its column's type. The delimiter is found when empty: a comma, unless semicolons fit the file better (as Excel writes CSV where the decimal separator is a comma). `encoding` (since 1.12) is what the file is written in, as PostgreSQL names it (`WIN1251`, `windows-1251`, `LATIN1`; empty: UTF-8), converted to the database's and checked; a compressed file (gzip, bzip2, xz, zstd) is read uncompressed, whatever its name |
 | `sc_csvzip(path text, query text, entry text = '', delimiter text = ',', append boolean = false)` | `bigint` | `sc_csv`'s file as the one entry of a ZIP archive at `path` (deflated, an existing one replaced): `entry`, or the archive's name with `.csv`. With `append` (since 1.12) an existing archive's other entries are kept, and one of the same name replaced |
 | `sc_csvzip(path text, files json or jsonb, delimiter text = ',', append boolean = false)` | `bigint` | a CSV file per query, as `sc_xlsx` makes a sheet per query: `{"name.csv": "query", ...}`, names relative paths (`/` between folders); the rows of all files together. Give the files as `json` or `jsonb` explicitly: an untyped string is taken as a query |
-| `sc_read_csvzip(path text, entry text, from_row integer = 1, delimiter text = '', encoding text = '')` | `SETOF record` | that entry of a ZIP archive read as `sc_read_csv` reads a file; an error naming the entries when there's no such one |
+| `sc_read_csvzip(path text, entry text = '', from_row integer = 1, delimiter text = '', encoding text = '')` | `SETOF record` | that entry of a ZIP archive read as `sc_read_csv` reads a file. `entry` (since 1.12) may be a shell pattern, `*` and `?` (`'CodesAndDescriptionsFull*.csv'`, matched against the entry's file name when it has no `/`), or `''` for the archive's only `.csv` entry; an error naming the entries when none or more than one matches |
 
 Since extension 1.7.
 

@@ -72,6 +72,8 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
+#include <fnmatch.h>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -651,18 +653,43 @@ namespace {
         std::size_t size = 0;
     };
 
+    // The entry entry names in an archive: that name; a shell pattern (* and ?, matched against its
+    // whole name, or its file name when the pattern has no '/'); or "" for the only .csv entry. One
+    // must match: throws, naming the entries, when none or more than one does.
+    template<typename Archive>
+    std::string entry_named(const Archive &archive, const std::string &entry) {
+        std::vector<std::string> names, matched;
+        for (const auto &each: archive.entries())
+            if (!each.name.ends_with('/')) names.push_back(each.name);
+        const bool pattern = entry.find_first_of("*?[") != std::string::npos;
+        for (const auto &name: names) {
+            if (entry.empty()) {
+                std::string lower = name;
+                std::ranges::transform(lower, lower.begin(), [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (lower.ends_with(".csv")) matched.push_back(name);
+            } else if (pattern) {
+                const auto slash = name.find_last_of('/');
+                const auto base = entry.find('/') == std::string::npos && slash != std::string::npos ? name.substr(slash + 1) : name;
+                if (::fnmatch(entry.c_str(), base.c_str(), 0) == 0) matched.push_back(name);
+            } else if (name == entry) {
+                matched.push_back(name);
+            }
+        }
+        if (matched.size() == 1) return matched.front();
+        std::string listed;
+        for (const auto &name: names) listed += (listed.empty() ? "" : ", ") + name;
+        const auto has = " (it has " + (listed.empty() ? std::string{"nothing"} : listed) + ")";
+        const auto what = entry.empty() ? std::string{"a .csv entry"} : "\"" + entry + "\"";
+        if (matched.empty()) throw std::invalid_argument("there's no " + what + " in it" + has);
+        throw std::invalid_argument("more than one entry is " + what + has);
+    }
+
     void read_csv_bytes(const char *function, const char *path, const char *entry, raw_bytes &out, sc_pglib::pending_error &error) noexcept {
         try {
             std::string bytes;
             if (entry) {
                 const auto archive = sc::archive::open(path);
-                if (!archive.contains(entry)) {
-                    std::string names;
-                    for (const auto &each: archive.entries())
-                        if (!each.name.ends_with('/')) names += (names.empty() ? "" : ", ") + each.name;
-                    throw std::invalid_argument(std::string{"there's no \""} + entry + "\" in it (it has " + (names.empty() ? "nothing" : names) + ")");
-                }
-                bytes = archive.read(entry);
+                bytes = archive.read(entry_named(archive, entry));
             } else {
                 std::ifstream file{path, std::ios::binary};
                 if (!file) throw std::runtime_error(std::string{"can't be opened: "} + strerror(errno));
