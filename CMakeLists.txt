@@ -94,7 +94,7 @@ message(STATUS "Building for ${SC_PGLIB_PG_VERSION} (${SC_PGLIB_PG_CONFIG})")
 # A module PostgreSQL loads with dlopen(), so no "lib" prefix and no link against the server:
 # its symbols resolve at load time. macOS needs that said explicitly, and PostgreSQL 16 and
 # later look for ".dylib" there.
-add_library(sc_pglib MODULE src/sc_pglib.cpp src/sc_redis.cpp src/sc_firebase.cpp src/sc_xlsx.cpp src/xlsx_format.cpp src/sc_files.cpp src/folders.cpp)
+add_library(sc_pglib MODULE src/sc_pglib.cpp src/sc_redis.cpp src/sc_firebase.cpp src/firebase_rows.cpp src/sc_xlsx.cpp src/xlsx_format.cpp src/sc_files.cpp src/folders.cpp)
 target_include_directories(sc_pglib PRIVATE "${SC_PGLIB_PG_INCLUDEDIR}")
 # sc::sc-redis brings sc::sc-core (base64) with it.
 target_link_libraries(sc_pglib PRIVATE sc::sc-redis)
@@ -111,7 +111,7 @@ if (APPLE)
     endif ()
 endif ()
 
-set(SC_PGLIB_EXTENSION_FILES sql/sc_pglib.control sql/sc_pglib--1.0.sql sql/sc_pglib--1.0--1.1.sql sql/sc_pglib--1.1--1.2.sql sql/sc_pglib--1.2--1.3.sql sql/sc_pglib--1.3--1.4.sql sql/sc_pglib--1.4--1.5.sql sql/sc_pglib--1.5--1.6.sql sql/sc_pglib--1.6--1.7.sql sql/sc_pglib--1.7--1.8.sql sql/sc_pglib--1.8--1.9.sql sql/sc_pglib--1.9--1.10.sql sql/sc_pglib--1.10--1.11.sql sql/sc_pglib--1.11--1.12.sql sql/sc_pglib--1.12--1.13.sql)
+set(SC_PGLIB_EXTENSION_FILES sql/sc_pglib.control sql/sc_pglib--1.0.sql sql/sc_pglib--1.0--1.1.sql sql/sc_pglib--1.1--1.2.sql sql/sc_pglib--1.2--1.3.sql sql/sc_pglib--1.3--1.4.sql sql/sc_pglib--1.4--1.5.sql sql/sc_pglib--1.5--1.6.sql sql/sc_pglib--1.6--1.7.sql sql/sc_pglib--1.7--1.8.sql sql/sc_pglib--1.8--1.9.sql sql/sc_pglib--1.9--1.10.sql sql/sc_pglib--1.10--1.11.sql sql/sc_pglib--1.11--1.12.sql sql/sc_pglib--1.12--1.13.sql sql/sc_pglib--1.13--1.14.sql)
 if (SC_PGLIB_INSTALL)
     install(TARGETS sc_pglib LIBRARY DESTINATION "${SC_PGLIB_PG_PKGLIBDIR}" COMPONENT runtime)
     install(FILES ${SC_PGLIB_EXTENSION_FILES} DESTINATION "${SC_PGLIB_PG_SHAREDIR}/extension" COMPONENT runtime)
@@ -133,6 +133,12 @@ if (SC_PGLIB_BUILD_TESTS)
     target_include_directories(test-folders PRIVATE src tests)
     add_test(NAME test-folders COMMAND test-folders)
     set_tests_properties(test-folders PROPERTIES LABELS unit)
+    # A Firebase foreign table's rows from a tree, without PostgreSQL or the network.
+    add_executable(test-firebase-rows tests/firebase_rows.cpp src/firebase_rows.cpp)
+    target_include_directories(test-firebase-rows PRIVATE src tests)
+    target_link_libraries(test-firebase-rows PRIVATE nlohmann_json::nlohmann_json)
+    add_test(NAME test-firebase-rows COMMAND test-firebase-rows)
+    set_tests_properties(test-firebase-rows PROPERTIES LABELS unit)
 endif ()
 
 #############

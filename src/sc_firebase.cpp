@@ -9,19 +9,28 @@
 //
 // Calls aren't transactional: a write happens at once, and stays when the transaction rolls back.
 // With on_error 'error' (the default) a failure is an ERROR; with 'warning' it's a WARNING and the
-// call returns NULL (or false).
+// call returns NULL (or false), a foreign table no rows.
+//
+// The wrapper's handler also makes foreign tables of it (read-only so far): see the end of the file.
 
 #include <sc_firebase.h>
 
+#include "firebase_rows.h"
+
+#include <algorithm>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "pg_glue.h"
 
 extern "C" {
 #include <access/reloptions.h>
+#include <catalog/pg_attribute.h>
 #include <catalog/pg_foreign_server.h>
+#include <catalog/pg_foreign_table.h>
 #include <catalog/pg_type.h>
 #include <catalog/pg_user_mapping.h>
 #include <commands/defrem.h>
@@ -32,7 +41,23 @@ extern "C" {
 #include <utils/builtins.h>
 #include <utils/jsonb.h>
 #include <utils/syscache.h>
+#include <commands/explain.h>
+#if PG_VERSION_NUM >= 180000
+#include <commands/explain_format.h>
+#endif
+#include <executor/executor.h>
+#include <foreign/fdwapi.h>
+#include <nodes/makefuncs.h>
+#include <nodes/nodeFuncs.h>
+#include <optimizer/clauses.h>
+#include <optimizer/optimizer.h>
+#include <optimizer/pathnode.h>
+#include <optimizer/planmain.h>
+#include <optimizer/restrictinfo.h>
+#include <utils/lsyscache.h>
+#include <utils/rel.h>
 
+PG_FUNCTION_INFO_V1(sc_firebase_fdw_handler);
 PG_FUNCTION_INFO_V1(sc_firebase_validator);
 PG_FUNCTION_INFO_V1(sc_firebase_get);
 PG_FUNCTION_INFO_V1(sc_firebase_keys);
@@ -95,10 +120,9 @@ namespace {
         return options;
     }
 
-    // The settings of the named sc_firebase server, checking the current user may use it.
-    settings settings_for(text *name_argument) {
-        const char *name = text_to_cstring(name_argument);
-        ForeignServer *server = GetForeignServerByName(name, false);
+    // The settings of an sc_firebase server, checking the current user may use it.
+    settings settings_for_server(ForeignServer *server) {
+        const char *name = server->servername;
         if (std::strcmp(GetForeignDataWrapper(server->fdwid)->fdwname, wrapper_name) != 0) {
             ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("server \"%s\" is not a %s server", name, wrapper_name)));
         }
@@ -131,6 +155,11 @@ namespace {
                             errhint("CREATE USER MAPPING FOR CURRENT_USER SERVER %s OPTIONS (credentials_file '/etc/...json')", name)));
         }
         return s;
+    }
+
+    // The settings of the named sc_firebase server.
+    settings settings_for(text *name_argument) {
+        return settings_for_server(GetForeignServerByName(text_to_cstring(name_argument), false));
     }
 
     struct client_entry {
@@ -191,7 +220,7 @@ namespace {
     // A jsonb argument as JSON text (PostgreSQL may raise, so before the C++ part).
     const char *json_text(Jsonb *value) { return JsonbToCString(nullptr, &value->root, VARSIZE(value)); }
 
-    Datum done_result(const outcome &result, FunctionCallInfo fcinfo) {
+    Datum done_result(const outcome &result, [[maybe_unused]] FunctionCallInfo fcinfo) {
         result.error.raise();
         PG_RETURN_BOOL(result.done);
     }
@@ -228,9 +257,21 @@ extern "C" Datum sc_firebase_validator(PG_FUNCTION_ARGS) {
                                 errmsg("a %s user mapping takes service_account or credentials_file, not both", wrapper_name)));
             }
             has_key = true;
+        } else if (catalog == ForeignTableRelationId) {
+            if (std::strcmp(option->defname, "path") != 0 && std::strcmp(option->defname, "keys") != 0) {
+                ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                                errmsg("invalid option \"%s\" for a %s foreign table", option->defname, wrapper_name),
+                                errhint("Valid options are path (under the server's root) and keys (the key columns, a level each).")));
+            }
+        } else if (catalog == AttributeRelationId) {
+            if (std::strcmp(option->defname, "field") != 0) {
+                ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                                errmsg("invalid option \"%s\" for a %s foreign table's column", option->defname, wrapper_name),
+                                errhint("The only valid option is field (the node's field, or a path into it, if not the column's name).")));
+            }
         } else {
             ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
-                            errmsg("%s takes options only on servers and user mappings", wrapper_name)));
+                            errmsg("%s takes options only on servers, user mappings, foreign tables and their columns", wrapper_name)));
         }
     }
     if (catalog == ForeignServerRelationId && !has_url) {
@@ -334,4 +375,323 @@ extern "C" Datum sc_firebase_move(PG_FUNCTION_ARGS) {
     result.error.raise();
     if (!result.done) PG_RETURN_NULL();
     PG_RETURN_BOOL(result.flag);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Foreign tables (read-only so far). A table maps a path under the server's root and the key
+// levels under it to rows (see firebase_rows.h):
+//
+//   CREATE FOREIGN TABLE device (account_id text, imei text, lat float8, online int, reg_nr text)
+//       SERVER app_db OPTIONS (path '', keys 'account_id,imei');
+//
+// A WHERE that sets the leading key columns with = (a constant or a parameter) fetches only that
+// part of the tree; PostgreSQL checks every condition again on the rows, so the others filter as
+// usual. Columns that aren't keys are the node's fields of the same name, or the column option
+// field ('gps/lat'). json and jsonb columns get the field as JSON; an empty string is NULL in a
+// column that isn't text-like (the device records hold "" for unknown numbers).
+
+namespace {
+    struct table_options {
+        const char *path = "";
+        const char *keys = "";
+    };
+
+    table_options options_of(const Oid relid) {
+        table_options t;
+        ListCell *cell;
+        foreach(cell, GetForeignTable(relid)->options) {
+            auto *option = static_cast<DefElem *>(lfirst(cell));
+            if (std::strcmp(option->defname, "path") == 0) t.path = defGetString(option);
+            else if (std::strcmp(option->defname, "keys") == 0) t.keys = defGetString(option);
+        }
+        return t;
+    }
+
+    // 'a, b' as palloc'd names; their count.
+    int split_keys(const char *keys, char ***names) {
+        char *copy = pstrdup(keys);
+        int count = 0;
+        *names = static_cast<char **>(palloc(sizeof(char *) * (std::strlen(keys) / 2 + 2)));
+        char *save = nullptr;
+        for (char *item = strtok_r(copy, ",", &save); item; item = strtok_r(nullptr, ",", &save)) {
+            while (*item == ' ' || *item == '\t') ++item;
+            char *end = item + std::strlen(item);
+            while (end > item && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+            if (*item) (*names)[count++] = item;
+        }
+        return count;
+    }
+
+    // The key columns' attribute numbers, in level order; an ERROR for a key that isn't a column.
+    AttrNumber *key_attnums(const Oid relid, char **names, const int count) {
+        auto *attnums = static_cast<AttrNumber *>(palloc(sizeof(AttrNumber) * (count + 1)));
+        for (int i = 0; i < count; ++i) {
+            attnums[i] = get_attnum(relid, names[i]);
+            if (attnums[i] == InvalidAttrNumber) {
+                ereport(ERROR, (errcode(ERRCODE_FDW_COLUMN_NAME_NOT_FOUND),
+                                errmsg("keys names \"%s\", which isn't a column of \"%s\"", names[i], get_rel_name(relid))));
+            }
+        }
+        return attnums;
+    }
+
+    Node *without_relabel(Node *node) {
+        while (node && IsA(node, RelabelType)) node = reinterpret_cast<Node *>(reinterpret_cast<RelabelType *>(node)->arg);
+        return node;
+    }
+
+    void firebase_rel_size(PlannerInfo *, RelOptInfo *baserel, Oid) {
+        baserel->rows = 1000;
+    }
+
+    void firebase_paths(PlannerInfo *root, RelOptInfo *baserel, Oid) {
+        add_path(baserel, reinterpret_cast<Path *>(create_foreignscan_path(root, baserel, nullptr, baserel->rows,
+#if PG_VERSION_NUM >= 180000
+                                                                           0,
+#endif
+                                                                           10, 10 + baserel->rows, NIL, baserel->lateral_relids, nullptr,
+#if PG_VERSION_NUM >= 170000
+                                                                           NIL,
+#endif
+                                                                           NIL)));
+    }
+
+    // Finds "key column = something constant for the scan" among the conditions: the somethings go
+    // in fdw_exprs (evaluated when the scan starts), their key levels in fdw_private. All the
+    // conditions stay for PostgreSQL to check.
+    ForeignScan *firebase_plan(PlannerInfo *, RelOptInfo *baserel, const Oid relid, ForeignPath *, List *tlist, List *scan_clauses,
+                               Plan *outer_plan) {
+        const table_options t = options_of(relid);
+        char **names = nullptr;
+        const int count = split_keys(t.keys, &names);
+        const AttrNumber *attnums = key_attnums(relid, names, count);
+        List *exprs = NIL;
+        List *pushed = NIL;
+        ListCell *cell;
+        foreach(cell, scan_clauses) {
+            auto *info = static_cast<RestrictInfo *>(lfirst(cell));
+            if (!IsA(info->clause, OpExpr)) continue;
+            auto *op = reinterpret_cast<OpExpr *>(info->clause);
+            if (list_length(op->args) != 2) continue;
+            const char *name = get_opname(op->opno);
+            if (!name || std::strcmp(name, "=") != 0) continue;
+            Node *sides[2] = {without_relabel(static_cast<Node *>(linitial(op->args))), without_relabel(static_cast<Node *>(lsecond(op->args)))};
+            for (int side = 0; side < 2; ++side) {
+                if (!sides[side] || !IsA(sides[side], Var)) continue;
+                auto *var = reinterpret_cast<Var *>(sides[side]);
+                Node *other = sides[1 - side];
+                if (static_cast<Index>(var->varno) != baserel->relid || var->varlevelsup != 0 || !is_pseudo_constant_clause(other)) continue;
+                for (int level = 0; level < count; ++level) {
+                    if (attnums[level] != var->varattno || list_member_int(pushed, level)) continue;
+                    exprs = lappend(exprs, other);
+                    pushed = lappend_int(pushed, level);
+                }
+            }
+        }
+        scan_clauses = extract_actual_clauses(scan_clauses, false);
+        return make_foreignscan(tlist, scan_clauses, baserel->relid, exprs, list_make1(pushed), NIL, NIL, outer_plan);
+    }
+
+    // A scan's state. Plain data, in the query's memory.
+    struct scan_state {
+        settings s;
+        const char *path = "";
+        char **key_names = nullptr;
+        int key_count = 0;
+        int pushed_count = 0;
+        int *pushed_level = nullptr;
+        List *expr_states = NIL;
+        Oid *expr_types = nullptr;
+        int natts = 0;
+        int *column_key = nullptr;      // the key level a column is, or -1
+        char **column_field = nullptr;  // else its field (nullptr: a dropped column)
+        bool *column_json = nullptr;
+        bool *column_text_like = nullptr;
+        FmgrInfo *in_functions = nullptr;
+        Oid *in_ioparams = nullptr;
+        int32 *typmods = nullptr;
+        char *explained = nullptr;      // EXPLAIN's "Firebase path"
+        bool fetched = false;
+        int row_count = 0;
+        char **values = nullptr;        // row_count x natts; nullptr: NULL
+        int next = 0;
+    };
+
+    void firebase_begin(ForeignScanState *node, int) {
+        auto *plan = reinterpret_cast<ForeignScan *>(node->ss.ps.plan);
+        Relation relation = node->ss.ss_currentRelation;
+        const Oid relid = RelationGetRelid(relation);
+        auto *state = static_cast<scan_state *>(palloc0(sizeof(scan_state)));
+        state->s = settings_for_server(GetForeignServer(GetForeignTable(relid)->serverid));
+        const table_options t = options_of(relid);
+        state->path = t.path;
+        state->key_count = split_keys(t.keys, &state->key_names);
+
+        TupleDesc description = RelationGetDescr(relation);
+        state->natts = description->natts;
+        const int n = state->natts + 1;
+        state->column_key = static_cast<int *>(palloc(sizeof(int) * n));
+        state->column_field = static_cast<char **>(palloc0(sizeof(char *) * n));
+        state->column_json = static_cast<bool *>(palloc0(sizeof(bool) * n));
+        state->column_text_like = static_cast<bool *>(palloc0(sizeof(bool) * n));
+        state->in_functions = static_cast<FmgrInfo *>(palloc0(sizeof(FmgrInfo) * n));
+        state->in_ioparams = static_cast<Oid *>(palloc0(sizeof(Oid) * n));
+        state->typmods = static_cast<int32 *>(palloc0(sizeof(int32) * n));
+        for (int i = 0; i < state->natts; ++i) {
+            Form_pg_attribute attribute = TupleDescAttr(description, i);
+            state->column_key[i] = -1;
+            if (attribute->attisdropped) continue;
+            const char *name = NameStr(attribute->attname);
+            for (int level = 0; level < state->key_count; ++level)
+                if (std::strcmp(state->key_names[level], name) == 0) state->column_key[i] = level;
+            state->column_field[i] = pstrdup(name);
+            ListCell *cell;
+            foreach(cell, GetForeignColumnOptions(relid, attribute->attnum)) {
+                auto *option = static_cast<DefElem *>(lfirst(cell));
+                if (std::strcmp(option->defname, "field") == 0) state->column_field[i] = defGetString(option);
+            }
+            state->column_json[i] = attribute->atttypid == JSONOID || attribute->atttypid == JSONBOID;
+            char category = 0;
+            bool preferred = false;
+            get_type_category_preferred(attribute->atttypid, &category, &preferred);
+            state->column_text_like[i] = category == TYPCATEGORY_STRING;
+            Oid input = InvalidOid;
+            getTypeInputInfo(attribute->atttypid, &input, &state->in_ioparams[i]);
+            fmgr_info(input, &state->in_functions[i]);
+            state->typmods[i] = attribute->atttypmod;
+        }
+
+        List *pushed = static_cast<List *>(linitial(plan->fdw_private));
+        state->pushed_count = list_length(pushed);
+        state->pushed_level = static_cast<int *>(palloc(sizeof(int) * (state->pushed_count + 1)));
+        state->expr_types = static_cast<Oid *>(palloc(sizeof(Oid) * (state->pushed_count + 1)));
+        int index = 0;
+        ListCell *cell;
+        foreach(cell, pushed) state->pushed_level[index++] = lfirst_int(cell);
+        index = 0;
+        foreach(cell, plan->fdw_exprs) state->expr_types[index++] = exprType(static_cast<Node *>(lfirst(cell)));
+        state->expr_states = ExecInitExprList(plan->fdw_exprs, reinterpret_cast<PlanState *>(node));
+
+        // EXPLAIN: the path fetched, the levels a WHERE sets as {name}.
+        StringInfoData text;
+        initStringInfo(&text);
+        appendStringInfoString(&text, state->s.root);
+        if (*state->path) appendStringInfo(&text, "%s%s", text.len ? "/" : "", state->path);
+        for (int level = 0; level < state->key_count; ++level) {
+            bool set = false;
+            for (int i = 0; i < state->pushed_count; ++i) set = set || state->pushed_level[i] == level;
+            if (!set) break;
+            appendStringInfo(&text, "%s{%s}", text.len ? "/" : "", state->key_names[level]);
+        }
+        if (text.len == 0) appendStringInfoChar(&text, '/');
+        state->explained = text.data;
+        node->fdw_state = state;
+    }
+
+    // Evaluates the key values and fetches the rows: in the query's memory, once per (re)scan.
+    void fetch(ForeignScanState *node, scan_state *state) {
+        ExprContext *context = node->ss.ps.ps_ExprContext;
+        auto **known = static_cast<char **>(palloc0(sizeof(char *) * (state->key_count + 1)));
+        bool impossible = false;
+        int index = 0;
+        ListCell *cell;
+        foreach(cell, state->expr_states) {
+            bool is_null = false;
+            const Datum value = ExecEvalExpr(static_cast<ExprState *>(lfirst(cell)), context, &is_null);
+            if (is_null) {
+                impossible = true; // key = NULL matches nothing
+            } else {
+                Oid output = InvalidOid;
+                bool varlena = false;
+                getTypeOutputInfo(state->expr_types[index], &output, &varlena);
+                known[state->pushed_level[index]] = OidOutputFunctionCall(output, value);
+            }
+            ++index;
+        }
+        state->fetched = true;
+        state->next = 0;
+        state->row_count = 0;
+        if (impossible) return;
+
+        const outcome result = run(state->s, [state, known](const sc::firebase::database &db, outcome &out) {
+            namespace rows = sc_pglib::firebase_rows;
+            std::vector<std::optional<std::string>> keys(static_cast<std::size_t>(state->key_count));
+            for (int level = 0; level < state->key_count; ++level)
+                if (known[level]) keys[static_cast<std::size_t>(level)] = std::string{known[level]};
+            const auto fetched = db.get(full_path(state->s, rows::fetch_path(state->path, keys).c_str()));
+            const auto found = rows::rows(fetched, keys);
+            if (found.empty()) return;
+            const auto cells = found.size() * static_cast<std::size_t>(state->natts);
+            auto **values = static_cast<char **>(sc_pglib::alloc_no_oom(sizeof(char *) * cells, out.error));
+            if (!values) return;
+            std::fill(values, values + cells, nullptr);
+            for (std::size_t r = 0; r < found.size(); ++r) {
+                for (int c = 0; c < state->natts; ++c) {
+                    char *&cell = values[r * static_cast<std::size_t>(state->natts) + static_cast<std::size_t>(c)];
+                    std::optional<std::string> text;
+                    if (state->column_key[c] >= 0) {
+                        text = found[r].keys[static_cast<std::size_t>(state->column_key[c])];
+                    } else if (state->column_field[c]) {
+                        if (const auto *value = rows::field(*found[r].node, state->column_field[c]))
+                            text = rows::text_of(*value, state->column_json[c]);
+                        if (text && text->empty() && !state->column_text_like[c]) text.reset();
+                    }
+                    if (text && !(cell = sc_pglib::new_cstring(*text, out.error))) return;
+                }
+            }
+            state->values = values;
+            state->row_count = static_cast<int>(found.size());
+        });
+        result.error.raise();
+    }
+
+    TupleTableSlot *firebase_iterate(ForeignScanState *node) {
+        auto *state = static_cast<scan_state *>(node->fdw_state);
+        TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+        ExecClearTuple(slot);
+        if (!state->fetched) {
+            // The executor calls this in the per-tuple memory, which is reset row by row.
+            const MemoryContext previous = MemoryContextSwitchTo(node->ss.ps.state->es_query_cxt);
+            fetch(node, state);
+            MemoryContextSwitchTo(previous);
+        }
+        if (state->next >= state->row_count) return slot;
+        char **row = state->values + static_cast<std::size_t>(state->next++) * static_cast<std::size_t>(state->natts);
+        for (int c = 0; c < state->natts; ++c) {
+            if (!row[c]) {
+                slot->tts_isnull[c] = true;
+                slot->tts_values[c] = 0;
+            } else {
+                slot->tts_isnull[c] = false;
+                slot->tts_values[c] = InputFunctionCall(&state->in_functions[c], row[c], state->in_ioparams[c], state->typmods[c]);
+            }
+        }
+        ExecStoreVirtualTuple(slot);
+        return slot;
+    }
+
+    void firebase_rescan(ForeignScanState *node) {
+        static_cast<scan_state *>(node->fdw_state)->fetched = false;
+    }
+
+    void firebase_end(ForeignScanState *) {
+    }
+
+    void firebase_explain(ForeignScanState *node, ExplainState *es) {
+        ExplainPropertyText("Firebase path", static_cast<scan_state *>(node->fdw_state)->explained, es);
+    }
+}
+
+// sc_firebase_fdw_handler(): the callbacks that make sc_firebase's foreign tables readable.
+extern "C" Datum sc_firebase_fdw_handler(PG_FUNCTION_ARGS) {
+    FdwRoutine *routine = makeNode(FdwRoutine);
+    routine->GetForeignRelSize = firebase_rel_size;
+    routine->GetForeignPaths = firebase_paths;
+    routine->GetForeignPlan = firebase_plan;
+    routine->BeginForeignScan = firebase_begin;
+    routine->IterateForeignScan = firebase_iterate;
+    routine->ReScanForeignScan = firebase_rescan;
+    routine->EndForeignScan = firebase_end;
+    routine->ExplainForeignScan = firebase_explain;
+    PG_RETURN_POINTER(routine);
 }

@@ -453,6 +453,41 @@ Each session keeps one client per server, so its access token (an hour's worth)
 serves every call in that time. Writes aren't transactional: they happen at once
 and stay when the transaction rolls back.
 
+### Foreign tables (read-only)
+
+A foreign table maps a path and the key levels under it to rows: every object
+node at the last key level is a row, the keys on the way to it are its key
+columns, and its fields fill the other columns by name (or the column option
+`field`, which may be a path into the node: `'gps/lat'`), converted to each
+column's type. Nodes that aren't objects, such as a `timestamp` beside the
+devices, are passed over.
+
+```sql
+CREATE FOREIGN TABLE device (
+    account_id text, imei text,                    -- the keys, a level each
+    lat float8, lng float8, speed int, online int, reg_nr text,
+    sats int OPTIONS (field 'gps/sat'),            -- a field under another name, or deeper
+    raw jsonb OPTIONS (field 'gps')                -- json and jsonb columns get the field as JSON
+) SERVER app_db OPTIONS (path '', keys 'account_id,imei');
+
+SELECT * FROM device WHERE account_id = '42';      -- fetches <root>/42 only
+SELECT account_id, count(*) FROM device GROUP BY 1; -- reads the whole path once
+```
+
+| Table option | |
+|---|---|
+| `path` | where the rows are, under the server's `root` (default: the root itself) |
+| `keys` | the key columns, one per level under the path, comma-separated; none: the node at the path is the one row |
+
+A `WHERE` that sets key columns with `=` (a constant, or a parameter of a
+prepared statement or a PL/pgSQL variable) narrows what's fetched: the leading
+ones join the path (`EXPLAIN` shows it as `Firebase path: <root>/{account_id}`),
+and later ones filter the walk. Every condition is still checked by
+PostgreSQL. Otherwise the whole path is read, once per scan. An empty string is
+NULL in a column that isn't text-like, as the device records keep `""` for
+unknown numbers. Inserting, updating and deleting through a foreign table come
+later; the functions above write.
+
 ## How it fits together
 
 - The module (`sc_pglib.so`, or `sc_pglib.dylib` on macOS) is a PostgreSQL

@@ -60,7 +60,7 @@ if [ "$major" -ge 18 ]; then
     check_extension=1
 else
     echo "PostgreSQL $major: running the extension scripts directly (CREATE EXTENSION of an uninstalled extension needs 18)"
-    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql sc_pglib--1.7--1.8.sql sc_pglib--1.8--1.9.sql sc_pglib--1.9--1.10.sql sc_pglib--1.10--1.11.sql sc_pglib--1.11--1.12.sql sc_pglib--1.12--1.13.sql; do
+    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql sc_pglib--1.7--1.8.sql sc_pglib--1.8--1.9.sql sc_pglib--1.9--1.10.sql sc_pglib--1.10--1.11.sql sc_pglib--1.11--1.12.sql sc_pglib--1.12--1.13.sql sc_pglib--1.13--1.14.sql; do
         sed -e '/^\\echo/d' -e "s|MODULE_PATHNAME|$library|g" "$sql_dir/$step" | psql_run
     done
     check_extension=0
@@ -452,22 +452,36 @@ if command -v openssl >/dev/null; then
     expect "on_error warning: a WARNING and NULL" "~WARNING:  Firebase server \"fb_quiet\"" "$(session <<<"select sc_firebase_get('fb_quiet', '42') is null")"
     check "~WARNING" "select sc_firebase_set('fb_quiet', '42', '{\"online\": 1}')"
     check "~WARNING" "select sc_firebase_move('fb_quiet', 'a', 'b')"
+    # Foreign tables: the path fetched narrows for leading keys set with = (EXPLAIN shows it, no request).
+    check "" "create foreign table fb_device (account_id text, imei text, lat float8, online int, sat int options (field 'gps/sat'), raw jsonb options (field 'gps')) server fb options (path 'all', keys 'account_id, imei')"
+    check "~invalid option \"table\"" "create foreign table fb_x (a text) server fb options (table 'x')"
+    check "~invalid option \"column\"" "create foreign table fb_x (a text options (column 'b')) server fb"
+    check "~keys names \"nope\", which isn't a column" "create foreign table fb_y (a text) server fb options (keys 'nope'); explain select * from fb_y"
+    check "~Firebase path: devices/all" "explain (costs off) select * from fb_device"
+    check "~Firebase path: devices/all/{account_id}" "explain (costs off) select * from fb_device where account_id = '42'"
+    check "~Firebase path: devices/all/{account_id}/{imei}" "explain (costs off) select lat from fb_device where imei = '3500' and '42' = account_id"
+    check "~Firebase path: devices/all" "explain (costs off) select * from fb_device where imei = '3500'"
+    expect "a parameter narrows it too" "~Firebase path: devices/all/{account_id}" "$(session <<<"set plan_cache_mode = force_generic_plan; prepare p(text) as select * from fb_device where account_id = \$1; explain (costs off) execute p('42')")"
+    check "~Firebase server \"fb\": sc::firebase: access token: no answer" "select * from fb_device where account_id = '42'"
+    check "" "create foreign table fb_quiet_device (account_id text, imei text) server fb_quiet options (keys 'account_id,imei')"
+    expect "on_error warning: a WARNING and no rows" "~WARNING:  Firebase server \"fb_quiet\"" "$(session <<<"select count(*) from fb_quiet_device")"
 else
     echo "skipped: Firebase key checks (no openssl)"
 fi
 
 if [ "$check_extension" = 1 ]; then
-    check "sc_pglib|1.13" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.14" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "" "set client_min_messages = warning; drop extension sc_pglib cascade"
     check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname like 'sc_firebase%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_mkdir', 'sc_xlsx_sheets', 'sc_csv', 'sc_read_csv', 'sc_csvzip', 'sc_read_csvzip', 'sc_move', 'sc_list_files', 'sc_remove_log'))"
     # Updating from 1.0, as an existing database does.
     check "" "create extension sc_pglib version '1.0'"
     check "f" "select exists (select 1 from pg_proc where proname = 'sc_redis_get')"
-    check "" "alter extension sc_pglib update"
-    check "sc_pglib|1.13" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    # 1.14 gives sc_firebase a handler, which PostgreSQL warns about (no foreign tables exist yet).
+    check "~changing the foreign-data wrapper handler" "alter extension sc_pglib update"
+    check "sc_pglib|1.14" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_redis')"
     check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_firebase')"
-    check "7" "select count(*) from pg_proc where proname like 'sc_firebase_%' and proname <> 'sc_firebase_validator'"
+    check "7" "select count(*) from pg_proc where proname like 'sc_firebase_%' and proname not in ('sc_firebase_validator', 'sc_firebase_fdw_handler')"
     check "t" "select exists (select 1 from pg_proc where proname = 'sc_redis_hgetall')"
     check "2" "select count(*) from pg_proc where proname = 'sc_redis_sadd'"
     check "7" "select count(*) from pg_proc where proname = 'sc_xlsx'"
