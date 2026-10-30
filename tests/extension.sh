@@ -60,7 +60,7 @@ if [ "$major" -ge 18 ]; then
     check_extension=1
 else
     echo "PostgreSQL $major: running the extension scripts directly (CREATE EXTENSION of an uninstalled extension needs 18)"
-    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql sc_pglib--1.7--1.8.sql sc_pglib--1.8--1.9.sql sc_pglib--1.9--1.10.sql sc_pglib--1.10--1.11.sql; do
+    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql sc_pglib--1.7--1.8.sql sc_pglib--1.8--1.9.sql sc_pglib--1.9--1.10.sql sc_pglib--1.10--1.11.sql sc_pglib--1.11--1.12.sql; do
         sed -e '/^\\echo/d' -e "s|MODULE_PATHNAME|$library|g" "$sql_dir/$step" | psql_run
     done
     check_extension=0
@@ -270,12 +270,41 @@ check "~its query isn't text" "select sc_csvzip('$work/x.zip', '{\"a.csv\": 1}':
 check "~a JSON object of names" "select sc_csvzip('$work/x.zip', '[]'::json)"
 check "~sc_csvzip: file \"bad.csv\": its query returns no rows" "select sc_csvzip('$work/x.zip', '{\"bad.csv\": \"create temp table sc_pglib_z (a int)\"}'::json)"
 check "~relation \"no_such_table\" does not exist" "select sc_csvzip('$work/x.zip', '{\"a.csv\": \"select * from no_such_table\"}'::json)"
+# CSV gzipped when the path ends in .gz, and read back uncompressed whatever its name
+check "2" "select sc_csv('$work/dump.csv.gz', 'select 1 as a, ''x'' as b union all select 2, ''y''')"
+if gzip -t "$work/dump.csv.gz" 2>/dev/null && [ "$(gzip -dc "$work/dump.csv.gz" | head -1 | tr -d '\r')" = "a,b" ]; then echo "ok: dump.csv.gz is gzip"; else echo "FAILED: dump.csv.gz isn't gzip"; failures=$((failures + 1)); fi
+check "2|y" "select a || '|' || b from sc_read_csv('$work/dump.csv.gz', 2) as x(a text, b text) where a = '2'"
+# An encoding converted to the database's: Привет in windows-1251
+printf 'word\n\317\360\350\342\345\362\n' > "$work/cyrillic.csv"
+check "Привет" "select a from sc_read_csv('$work/cyrillic.csv', 2, ',', 'windows-1251') as x(a text)"
+check "Привет" "select a from sc_read_csv('$work/cyrillic.csv', 2, ',', 'WIN1251') as x(a text)"
+check "~invalid byte sequence for encoding \"UTF8\"" "select a from sc_read_csv('$work/cyrillic.csv', 2) as x(a text)"
+check "~isn't an encoding PostgreSQL knows" "select a from sc_read_csv('$work/cyrillic.csv', 2, ',', 'klingon') as x(a text)"
+# Added to an archive: the others kept, one of the same name replaced
+check "1" "select sc_csvzip('$work/added.zip', 'select 1 as one', 'a.csv')"
+check "1" "select sc_csvzip('$work/added.zip', 'select 2 as two', 'b.csv', ',', true)"
+check "1" "select sc_csvzip('$work/added.zip', 'select 3 as three', 'a.csv', ',', true)"
+check "3|2" "select (select a from sc_read_csvzip('$work/added.zip', 'a.csv', 2) as x(a text)) || '|' || (select a from sc_read_csvzip('$work/added.zip', 'b.csv', 2) as x(a text))"
+check "1" "select sc_csvzip('$work/added.zip', 'select 4 as four', 'c.csv')"
+check "~there's no \"a.csv\" in it (it has c.csv)" "select * from sc_read_csvzip('$work/added.zip', 'a.csv') as x(a text)"
+# sc_move and sc_list_files: only under /var/www/data/output (their moving and listing is tested by test-folders)
+check "~isn't /var/www/data/output or a folder in it" "select sc_move('$work/one.xlsx', '/var/www/data/output/x')"
+check "~isn't /var/www/data/output or a folder in it" "select sc_move('/var/www/data/output/x', '$work/x')"
+check "~\"..\" part" "select * from sc_list_files('/var/www/data/output/../x')"
+# sc_remove_log: a finished log in log_directory; never a path
+mkdir -p "$work/data/log" && echo old > "$work/data/log/old.csv"
+check "t" "select sc_remove_log('old.csv')"
+check "f" "select sc_remove_log('old.csv')"
+[ ! -e "$work/data/log/old.csv" ] && echo "ok: old.csv is gone" || { echo "FAILED: old.csv is still there"; failures=$((failures + 1)); }
+check "~isn't a file name in the log folder" "select sc_remove_log('../postgresql.conf')"
+check "~isn't a file name in the log folder" "select sc_remove_log('..')"
 check "" "create role sc_pglib_writer"
 # sc_mkdir: only under /var/www/data/output (its making is tested by test-folders), revoked from PUBLIC
 check "~isn't /var/www/data/output or a folder in it" "select sc_mkdir('$work/x')"
 check "~\"..\" part" "select sc_mkdir('/var/www/data/output/a/../../x')"
 check "~isn't an absolute path" "select sc_mkdir('output/x')"
 check "f" "select has_function_privilege('sc_pglib_writer', 'sc_mkdir(text)', 'execute')"
+check "false|false|false" "select has_function_privilege('sc_pglib_writer', 'sc_move(text, text)', 'execute') || '|' || has_function_privilege('sc_pglib_writer', 'sc_list_files(text, interval, integer)', 'execute') || '|' || has_function_privilege('sc_pglib_writer', 'sc_remove_log(text)', 'execute')"
 check "~permission denied to read a file" "set role sc_pglib_writer; select sc_read_xlsx('$work/one.xlsx')"
 check "~permission denied to read a file" "set role sc_pglib_writer; select * from sc_read_xlsx('$work/one.xlsx', 1) as x(a text)"
 check "~permission denied to read a file" "set role sc_pglib_writer; select * from sc_xlsx_sheets('$work/one.xlsx')"
@@ -391,14 +420,14 @@ else
 fi
 
 if [ "$check_extension" = 1 ]; then
-    check "sc_pglib|1.11" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.12" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "" "set client_min_messages = warning; drop extension sc_pglib cascade"
-    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_mkdir', 'sc_xlsx_sheets', 'sc_csv', 'sc_read_csv', 'sc_csvzip', 'sc_read_csvzip'))"
+    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_mkdir', 'sc_xlsx_sheets', 'sc_csv', 'sc_read_csv', 'sc_csvzip', 'sc_read_csvzip', 'sc_move', 'sc_list_files', 'sc_remove_log'))"
     # Updating from 1.0, as an existing database does.
     check "" "create extension sc_pglib version '1.0'"
     check "f" "select exists (select 1 from pg_proc where proname = 'sc_redis_get')"
     check "" "alter extension sc_pglib update"
-    check "sc_pglib|1.11" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.12" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_redis')"
     check "t" "select exists (select 1 from pg_proc where proname = 'sc_redis_hgetall')"
     check "2" "select count(*) from pg_proc where proname = 'sc_redis_sadd'"

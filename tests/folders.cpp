@@ -6,12 +6,32 @@
 #include <sys/stat.h>
 
 #include <filesystem>
+#include <chrono>
 #include <fstream>
+#include <iterator>
 #include <random>
 #include <stdexcept>
 #include <string>
 
 namespace {
+    template<typename Work>
+    bool refused_by(Work work, const std::string &why) {
+        try {
+            work();
+        } catch (const std::runtime_error &problem) {
+            return std::string{problem.what()}.find(why) != std::string::npos;
+        }
+        return false;
+    }
+
+    bool refused_move(const std::string &root, const std::string &from, const std::string &to, const std::string &why) {
+        return refused_by([&] { (void) sc_pglib::move_path(root, from, to); }, why);
+    }
+
+    bool refused_list(const std::string &root, const std::string &folder, const std::string &why) {
+        return refused_by([&] { (void) sc_pglib::list_files(root, folder); }, why);
+    }
+
     bool refused(const std::string &root, const std::string &path, const std::string &why) {
         try {
             (void) sc_pglib::make_folders(root, path);
@@ -70,6 +90,55 @@ int main() {
         CHECK(refused(root, root + "/out", "is a symbolic link"));
         std::ofstream{root + "/file"} << "x";
         CHECK(refused(root, root + "/file/x", "isn't a folder"));
+    }
+
+    SECTION("Moved: renamed, into a folder (a trailing slash, or one that's there), a file replaced");
+    {
+        fs::create_directories(root + "/dsn/processed");
+        std::ofstream{root + "/dsn/a.txt"} << "a";
+        std::ofstream{root + "/dsn/b.txt"} << "b";
+        CHECK_EQ(sc_pglib::move_path(root, root + "/dsn/a.txt", root + "/dsn/processed/"), root + "/dsn/processed/a.txt");
+        CHECK(fs::exists(root + "/dsn/processed/a.txt") && !fs::exists(root + "/dsn/a.txt"));
+        CHECK_EQ(sc_pglib::move_path(root, root + "/dsn/b.txt", root + "/dsn/processed"), root + "/dsn/processed/b.txt");
+        CHECK_EQ(sc_pglib::move_path(root, root + "/dsn/processed/b.txt", root + "/dsn/renamed.txt"), root + "/dsn/renamed.txt");
+        std::ofstream{root + "/dsn/c.txt"} << "c";
+        CHECK_EQ(sc_pglib::move_path(root, root + "/dsn/c.txt", root + "/dsn/renamed.txt"), root + "/dsn/renamed.txt");
+        std::ifstream replaced{root + "/dsn/renamed.txt"};
+        const std::string content{std::istreambuf_iterator<char>{replaced}, std::istreambuf_iterator<char>{}};
+        CHECK_EQ(content, std::string{"c"});
+        // A folder moves too.
+        CHECK_EQ(sc_pglib::move_path(root, root + "/dsn/processed", root + "/dsn/done"), root + "/dsn/done");
+    }
+
+    SECTION("Not moved: missing, a link, outside, root itself, a missing target folder");
+    {
+        CHECK(refused_move(root, root + "/dsn/none.txt", root + "/dsn/x", "isn't there"));
+        CHECK(refused_move(root, root + "/out", root + "/dsn/x", "symbolic link"));
+        CHECK(refused_move(root, root + "/dsn/renamed.txt", scratch.string() + "/x", "or a folder in it"));
+        CHECK(refused_move(root, scratch.string() + "/elsewhere", root + "/x", "or a folder in it"));
+        CHECK(refused_move(root, root, root + "/x", "itself"));
+        CHECK(refused_move(root, root + "/dsn/renamed.txt", root + "/nowhere/x", "nowhere isn't there"));
+        CHECK(refused_move(root, root + "/dsn/renamed.txt", root + "/out/x", "is a symbolic link"));
+        CHECK(!fs::exists(scratch / "elsewhere" / "x"));
+    }
+
+    SECTION("Listed: files only, links left out, oldest first, folders below too");
+    {
+        fs::create_directories(root + "/queue/123");
+        std::ofstream{root + "/queue/new.txt"} << "new";
+        std::ofstream{root + "/queue/123/old.txt"} << "old!";
+        fs::last_write_time(root + "/queue/123/old.txt", fs::last_write_time(root + "/queue/new.txt") - std::chrono::hours{2});
+        fs::create_symlink(root + "/queue/new.txt", root + "/queue/link.txt");
+        const auto files = sc_pglib::list_files(root, root + "/queue/");
+        CHECK_EQ(files.size(), std::size_t{2});
+        if (files.size() == 2) {
+            CHECK_EQ(files[0].path, root + "/queue/123/old.txt");
+            CHECK_EQ(files[0].size, std::int64_t{4});
+            CHECK_EQ(files[1].path, root + "/queue/new.txt");
+            CHECK(files[0].seconds < files[1].seconds);
+        }
+        CHECK(refused_list(root, root + "/out", "is a symbolic link"));
+        CHECK(refused_list(root, root + "/queue/none", "isn't there"));
     }
 
     fs::remove_all(scratch);

@@ -268,43 +268,64 @@ SELECT * FROM sc_read_csvzip('/var/www/data/input/prices.zip', 'prices.csv', 2) 
 -- Several CSV files in one archive, a query each (json keeps their order, jsonb sorts them)
 SELECT sc_csvzip('/var/www/data/output/export.zip',
                  '{"items.csv": "select * from items", "reports/prices.csv": "select * from prices"}'::json);
+
+-- Gzipped (the path ends in .gz), read back as it is; another encoding; added to an archive
+SELECT sc_csv('/var/www/data/output/dump/gl.csv.gz', 'select * from gl');
+SELECT * FROM sc_read_csv('/var/www/data/input/efile.csv', 2, encoding => 'windows-1251') AS x(a text, b text);
+SELECT sc_csvzip('/var/www/data/output/dump.zip', 'select * from more', 'more.csv', append => true);
 ```
 
 | Function | Returns | |
 |---|---|---|
-| `sc_csv(path text, query text, delimiter text = ',')` | `bigint` | the rows written (the header aside): numbers as numbers, booleans as `TRUE`/`FALSE`, dates and times as ISO text, `NULL` as an empty field, anything else as its text, quoted when it needs to be (RFC 4180) |
-| `sc_read_csv(path text, from_row integer = 1, delimiter text = '')` | `SETOF record` | the rows from `from_row` on, empty ones left out, into a column list `AS x(a text, ...)` as `sc_read_xlsx`'s; each field as written, converted to its column's type. The delimiter is found when empty: a comma, unless semicolons fit the file better (as Excel writes CSV where the decimal separator is a comma) |
-| `sc_csvzip(path text, query text, entry text = '', delimiter text = ',')` | `bigint` | `sc_csv`'s file as the one entry of a ZIP archive at `path` (deflated, an existing one replaced): `entry`, or the archive's name with `.csv` |
-| `sc_csvzip(path text, files json or jsonb, delimiter text = ',')` | `bigint` | a CSV file per query, as `sc_xlsx` makes a sheet per query: `{"name.csv": "query", ...}`, names relative paths (`/` between folders); the rows of all files together. Give the files as `json` or `jsonb` explicitly: an untyped string is taken as a query |
-| `sc_read_csvzip(path text, entry text, from_row integer = 1, delimiter text = '')` | `SETOF record` | that entry of a ZIP archive read as `sc_read_csv` reads a file; an error naming the entries when there's no such one |
+| `sc_csv(path text, query text, delimiter text = ',')` | `bigint` | the rows written (the header aside), gzipped when `path` ends in `.gz` (since 1.12): numbers as numbers, booleans as `TRUE`/`FALSE`, dates and times as ISO text, `NULL` as an empty field, anything else as its text, quoted when it needs to be (RFC 4180) |
+| `sc_read_csv(path text, from_row integer = 1, delimiter text = '', encoding text = '')` | `SETOF record` | the rows from `from_row` on, empty ones left out, into a column list `AS x(a text, ...)` as `sc_read_xlsx`'s; each field as written, converted to its column's type. The delimiter is found when empty: a comma, unless semicolons fit the file better (as Excel writes CSV where the decimal separator is a comma). `encoding` (since 1.12) is what the file is written in, as PostgreSQL names it (`WIN1251`, `windows-1251`, `LATIN1`; empty: UTF-8), converted to the database's and checked; a compressed file (gzip, bzip2, xz, zstd) is read uncompressed, whatever its name |
+| `sc_csvzip(path text, query text, entry text = '', delimiter text = ',', append boolean = false)` | `bigint` | `sc_csv`'s file as the one entry of a ZIP archive at `path` (deflated, an existing one replaced): `entry`, or the archive's name with `.csv`. With `append` (since 1.12) an existing archive's other entries are kept, and one of the same name replaced |
+| `sc_csvzip(path text, files json or jsonb, delimiter text = ',', append boolean = false)` | `bigint` | a CSV file per query, as `sc_xlsx` makes a sheet per query: `{"name.csv": "query", ...}`, names relative paths (`/` between folders); the rows of all files together. Give the files as `json` or `jsonb` explicitly: an untyped string is taken as a query |
+| `sc_read_csvzip(path text, entry text, from_row integer = 1, delimiter text = '', encoding text = '')` | `SETOF record` | that entry of a ZIP archive read as `sc_read_csv` reads a file; an error naming the entries when there's no such one |
 
 Since extension 1.7.
 
-## Folders
+## Files and folders
 
-`sc_mkdir` makes a folder and its missing parents, as `mkdir -p` does, but only in
-`/var/www/data/output` and below. That place is compiled in: no setting changes it. A database
-function can then make the folder it writes a file into without running a program (`copy ... to
-program 'mkdir -p ...'`, which needs `pg_execute_server_program`).
+`sc_mkdir`, `sc_move` and `sc_list_files` make, move and list files and folders as `mkdir -p`,
+`mv` and `find -type f` do, but only in `/var/www/data/output` and below. That place is compiled
+in: no setting changes it. Database functions can then do so without running a program (`copy ...
+to program 'mkdir -p ...'`, which needs `pg_execute_server_program`).
 
 ```sql
-PERFORM sc_mkdir('/var/www/data/output/omart/2026/Oct/');   -- '/var/www/data/output/omart/2026/Oct'
+PERFORM sc_mkdir('/var/www/data/output/omart/2026/Oct/');              -- '/var/www/data/output/omart/2026/Oct'
+PERFORM sc_move('/var/www/data/output/dsn/a.txt', '/var/www/data/output/dsn/processed/');
+SELECT path FROM sc_list_files('/var/www/data/output/queue/123', '1 minute', 1000);
 ```
 
 | Function | Returns | Notes |
 |---|---|---|
 | `sc_mkdir(path text)` | `text` | the folder, without a trailing slash |
+| `sc_move("from" text, "to" text)` | `text` | where it is now (since 1.12) |
+| `sc_list_files(folder text, older_than interval = null, max integer = null)` | `TABLE(path text, modified timestamptz, size bigint)` | since 1.12 |
 
-- The path is absolute, `/var/www/data/output` or a folder in it, with no empty, `.` or `..`
-  parts (one trailing slash is fine). A folder that's there already is fine; a file in the
-  way isn't. Anything else is an error that names the path.
+- Every path is absolute, `/var/www/data/output` or in it, with no empty, `.` or `..` parts
+  (one trailing slash is fine). Anything else is an error that names the path.
 - Nothing on the way may be a symbolic link: each part is opened without following one, so
   no link, planted before or while it runs, can lead out of the folder.
-- Folders it makes are `0755` whatever the server's umask (PostgreSQL's 0077 made `mkdir -p`
-  give `0700`), and belong to the server's operating system user. Folders that are there keep
-  their mode.
-- `EXECUTE` is revoked from `PUBLIC`: `GRANT EXECUTE ON FUNCTION sc_mkdir(text) TO ...` the
-  roles that need it.
+- `sc_mkdir`: a folder that's there already is fine; a file in the way isn't. Folders it makes
+  are `0755` whatever the server's umask (PostgreSQL's 0077 made `mkdir -p` give `0700`), and
+  belong to the server's operating system user. Folders that are there keep their mode.
+- `sc_move` moves a file or a folder: renamed to `to`, or into `to` keeping its name when `to`
+  ends with a slash or is a folder that's there, as `mv` does. A file at `to` is replaced; `to`'s
+  folder must be there (`sc_mkdir` it first). Across filesystems a file is copied, then removed.
+- `sc_list_files` gives the files in a folder and the folders in it (links left out, as `find
+  -type f` does), oldest first: those modified longer than `older_than` ago (`'1 minute'` for
+  `find -mmin +1`), at most `max`.
+- `EXECUTE` on each is revoked from `PUBLIC`: `GRANT EXECUTE ON FUNCTION sc_mkdir(text) TO ...`
+  (and `sc_move(text, text)`, `sc_list_files(text, interval, integer)`) the roles that need it.
+
+### The server's logs
+
+`sc_remove_log(name)` removes one of the server's own log files, by its name in
+`log_directory` as `pg_ls_logdir()` gives it, once it has been read (`copy ... from
+'log/<name>'`): `true`, or `false` when it isn't there. Only a plain file name, never the file the
+server writes to now (`current_logfiles`). Since 1.12; `EXECUTE` is revoked from `PUBLIC`.
 
 ## Redis
 
@@ -387,7 +408,7 @@ How it behaves:
 
 - The module (`sc_pglib.so`, or `sc_pglib.dylib` on macOS) is a PostgreSQL
   loadable module using the version-1 calling convention: `src/sc_pglib.cpp`
-  (base64), `src/sc_redis.cpp` (Redis), `src/sc_xlsx.cpp` (Excel workbooks and CSV files), `src/xlsx_format.cpp` (a sheet's formatting) and `src/sc_mkdir.cpp` with `src/folders.cpp` (folders),
+  (base64), `src/sc_redis.cpp` (Redis), `src/sc_xlsx.cpp` (Excel workbooks and CSV files), `src/xlsx_format.cpp` (a sheet's formatting) and `src/sc_files.cpp` with `src/folders.cpp` (files, folders and the server's logs),
   linking `sc::sc-redis` and `sc::sc-core` statically, and hiredis and
   sc-office's shared library dynamically. `src/pg_glue.h` has the rules
   for mixing C++ and PostgreSQL: C++ exceptions never reach PostgreSQL, and
@@ -395,11 +416,11 @@ How it behaves:
   because `ereport()` `longjmp()`s past destructors.
 - `sql/sc_pglib.control` and the `sql/sc_pglib--*.sql` scripts are what `CREATE
   EXTENSION` reads: `sc_pglib--1.0.sql` (base64) and the updates `1.0--1.1`
-  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`), `1.4--1.5` (`sc_read_xlsx`), `1.5--1.6` (sheets as rows, `sc_xlsx_sheets`) `1.6--1.7` (`sc_csv`, `sc_read_csv`), `1.7--1.8` (`sc_mkdir`), `1.8--1.9` (`sc_csvzip`, `sc_read_csvzip`), `1.9--1.10` (`sc_csvzip` with several files) and `1.10--1.11` (`sc_xlsx` with formatting). They and the module install into the server's own directories
+  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`), `1.4--1.5` (`sc_read_xlsx`), `1.5--1.6` (sheets as rows, `sc_xlsx_sheets`) `1.6--1.7` (`sc_csv`, `sc_read_csv`), `1.7--1.8` (`sc_mkdir`), `1.8--1.9` (`sc_csvzip`, `sc_read_csvzip`), `1.9--1.10` (`sc_csvzip` with several files), `1.10--1.11` (`sc_xlsx` with formatting) and `1.11--1.12` (CSV gzipped, in an encoding and added to an archive; `sc_move`, `sc_list_files`, `sc_remove_log`). They and the module install into the server's own directories
   (`pg_config --sharedir`/extension and `--pkglibdir`).
-- The extension version (`1.11`) is separate from the package version. A package
+- The extension version (`1.12`) is separate from the package version. A package
   update replaces the module in place; adding or changing SQL objects needs a new
-  extension version with an update script (`sc_pglib--1.11--1.12.sql`), after which
+  extension version with an update script (`sc_pglib--1.12--1.13.sql`), after which
   databases run `ALTER EXTENSION sc_pglib UPDATE`.
 
 ## Building

@@ -64,6 +64,8 @@
 //                                      that entry read as sc_read_csv reads a file
 
 #include <excel.h>
+#include <codec.h>
+#include <codec_gzip.h>
 #include <sc_archive.h>
 #include <sc_csv.h>
 
@@ -75,6 +77,8 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <fstream>
+#include <iterator>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -97,6 +101,7 @@ extern "C" {
 #include <utils/lsyscache.h>
 #include <utils/jsonb.h>
 #include <utils/timestamp.h>
+#include <mb/pg_wchar.h>
 
 PG_FUNCTION_INFO_V1(sc_xlsx_query);
 PG_FUNCTION_INFO_V1(sc_xlsx_sheets);
@@ -638,34 +643,90 @@ namespace {
         }
     }
 
-    // A CSV file's rows that have a value, every field as text, into out. Never raises.
-    void read_csv_rows(const char *path, const char delimiter, const int from_row, read_rows &out, sc_pglib::pending_error &error) noexcept {
+    // A CSV file's bytes (an entry of a ZIP archive when entry isn't null), gunzipped when they're
+    // compressed (gzip, bzip2, xz or zstd, whatever the name says), into out (allocated in the
+    // current context). Never raises.
+    struct raw_bytes {
+        char *data = nullptr;
+        std::size_t size = 0;
+    };
+
+    void read_csv_bytes(const char *function, const char *path, const char *entry, raw_bytes &out, sc_pglib::pending_error &error) noexcept {
         try {
-            rows_into(sc::office::csv::read(path, {.delimiter = delimiter, .typed = false}), from_row, out, error);
+            std::string bytes;
+            if (entry) {
+                const auto archive = sc::archive::open(path);
+                if (!archive.contains(entry)) {
+                    std::string names;
+                    for (const auto &each: archive.entries())
+                        if (!each.name.ends_with('/')) names += (names.empty() ? "" : ", ") + each.name;
+                    throw std::invalid_argument(std::string{"there's no \""} + entry + "\" in it (it has " + (names.empty() ? "nothing" : names) + ")");
+                }
+                bytes = archive.read(entry);
+            } else {
+                std::ifstream file{path, std::ios::binary};
+                if (!file) throw std::runtime_error(std::string{"can't be opened: "} + strerror(errno));
+                bytes.assign(std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{});
+                if (file.bad()) throw std::runtime_error("couldn't be read");
+            }
+            if (const auto codec = sc::compression::detect(bytes)) bytes = codec->decompress(bytes);
+            if (bytes.size() >= MaxAllocHugeSize) throw std::runtime_error("it's too big to read");
+            out.data = static_cast<char *>(MemoryContextAllocExtended(CurrentMemoryContext, bytes.size() + 1, MCXT_ALLOC_HUGE | MCXT_ALLOC_NO_OOM));
+            if (!out.data) {
+                error.set(ERRCODE_OUT_OF_MEMORY, ERROR, "%s: out of memory", function);
+                return;
+            }
+            std::memcpy(out.data, bytes.data(), bytes.size());
+            out.data[bytes.size()] = '\0';
+            out.size = bytes.size();
         } catch (const std::exception &problem) {
-            error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "sc_read_csv: \"%s\": %s", path, problem.what());
+            error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "%s: \"%s\": %s", function, path, problem.what());
         } catch (...) {
-            error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "sc_read_csv: unexpected C++ exception");
+            error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "%s: unexpected C++ exception", function);
         }
     }
 
-    // A CSV file inside a ZIP archive, read as read_csv_rows() reads one. Never raises.
-    void read_csvzip_rows(const char *path, const char *entry, const char delimiter, const int from_row, read_rows &out,
-                          sc_pglib::pending_error &error) noexcept {
-        try {
-            const auto archive = sc::archive::open(path);
-            if (!archive.contains(entry)) {
-                std::string names;
-                for (const auto &each: archive.entries())
-                    if (!each.name.ends_with('/')) names += (names.empty() ? "" : ", ") + each.name;
-                throw std::invalid_argument(std::string{"there's no \""} + entry + "\" in it (it has " + (names.empty() ? "nothing" : names) + ")");
-            }
-            rows_into(sc::office::csv::read_from(archive.read(entry), {.delimiter = delimiter, .typed = false}), from_row, out, error);
-        } catch (const std::exception &problem) {
-            error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "sc_read_csvzip: \"%s\": %s", path, problem.what());
-        } catch (...) {
-            error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "sc_read_csvzip: unexpected C++ exception");
+    // The bytes from encoding (a PostgreSQL name: 'WIN1251', 'windows-1251', 'LATIN1'; "" is UTF-8)
+    // into the database's, checked. PostgreSQL code: raises for a name it doesn't know, or bytes that
+    // aren't that encoding.
+    void to_database_encoding(const char *function, const char *encoding, raw_bytes &bytes) {
+        const int from = *encoding ? pg_char_to_encoding(encoding) : PG_UTF8;
+        if (from < 0) ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("%s: \"%s\" isn't an encoding PostgreSQL knows", function, encoding)));
+        if (from == GetDatabaseEncoding()) {
+            // Checked all the same, as COPY checks what it reads.
+            (void) pg_verify_mbstr(from, bytes.data, static_cast<int>(bytes.size), false);
+            return;
         }
+        char *converted = reinterpret_cast<char *>(pg_do_encoding_conversion(reinterpret_cast<unsigned char *>(bytes.data), static_cast<int>(bytes.size), from,
+                                                                            GetDatabaseEncoding()));
+        if (converted != bytes.data) {
+            bytes.data = converted;
+            bytes.size = std::strlen(converted);
+        }
+    }
+
+    // A CSV file's rows that have a value, every field as text, into out. Never raises.
+    void parse_csv_rows(const char *function, const char *path, const raw_bytes &bytes, const char delimiter, const int from_row, read_rows &out,
+                        sc_pglib::pending_error &error) noexcept {
+        try {
+            rows_into(sc::office::csv::read_from(std::string{bytes.data, bytes.size}, {.delimiter = delimiter, .typed = false}), from_row, out, error);
+        } catch (const std::exception &problem) {
+            error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "%s: \"%s\": %s", function, path, problem.what());
+        } catch (...) {
+            error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "%s: unexpected C++ exception", function);
+        }
+    }
+
+    // sc_read_csv and sc_read_csvzip: bytes, encoding, rows. PostgreSQL code: raises.
+    void read_csv_file(const char *function, const char *path, const char *entry, const char *encoding, const char delimiter, const int from_row,
+                       read_rows &out) {
+        raw_bytes bytes;
+        sc_pglib::pending_error error;
+        read_csv_bytes(function, path, entry, bytes, error);
+        error.raise();
+        to_database_encoding(function, encoding, bytes);
+        parse_csv_rows(function, path, bytes, delimiter, from_row, out, error);
+        error.raise();
     }
 
     // The workbook's sheet names, in order, into names. Never raises.
@@ -917,14 +978,39 @@ namespace {
     // The queries' rows written as a CSV file at path (the first query's), or as a ZIP archive at path
     // with an entry per query (zip: each sheet_data's name is its entry); then made readable by all.
     // Never raises.
-    void write_csv(const char *path, const sheet_data *data, const int count, const char delimiter, const bool zip,
+    //
+    // A path ending in .gz (not zip) is written gzipped. append (zip): the archive's other entries are
+    // kept, an entry of the same name replaced; without one there, it's made.
+    void write_csv(const char *path, const sheet_data *data, const int count, const char delimiter, const bool zip, const bool append,
                    sc_pglib::pending_error &error) noexcept {
         const char *function = zip ? "sc_csvzip" : "sc_csv";
         try {
             if (zip) {
+                std::vector<std::pair<std::string, std::string>> kept;
+                struct stat there{};
+                if (append && ::stat(path, &there) == 0) {
+                    const auto old = sc::archive::open(path);
+                    for (const auto &each: old.entries()) {
+                        if (each.name.ends_with('/')) continue;
+                        bool replaced = false;
+                        for (int i = 0; i < count && !replaced; ++i) replaced = each.name == data[i].name;
+                        if (!replaced) kept.emplace_back(each.name, old.read(each.name));
+                    }
+                }
                 auto archive = sc::archive::create(path);
+                for (auto &[name, bytes]: kept) archive.add(name, std::move(bytes));
                 for (int i = 0; i < count; ++i) archive.add(data[i].name, sc::office::csv::bytes(csv_of(data[i]), {.delimiter = delimiter}));
                 archive.close();
+            } else if (std::string_view{path}.ends_with(".gz")) {
+                const auto packed = sc::compression::gzip{}.compress(sc::office::csv::bytes(csv_of(data[0]), {.delimiter = delimiter}));
+                std::ofstream file{path, std::ios::binary | std::ios::trunc};
+                if (!file) throw std::runtime_error(std::string{"can't be written: "} + strerror(errno));
+                file.write(packed.data(), static_cast<std::streamsize>(packed.size()));
+                file.close();
+                if (!file) {
+                    std::remove(path);
+                    throw std::runtime_error("couldn't be written");
+                }
             } else {
                 sc::office::csv::write(csv_of(data[0]), path, {.delimiter = delimiter});
             }
@@ -980,7 +1066,8 @@ namespace {
 
     // sc_csv and sc_csvzip: the queries' rows written as a CSV file, or a ZIP archive of them (zip; each
     // sheet's name its entry). PostgreSQL code: raises.
-    Datum make_csv(PG_FUNCTION_ARGS, const char *function, sheet_data *sheets, const int count, const bool zip, const int delimiter_argument) {
+    Datum make_csv(PG_FUNCTION_ARGS, const char *function, sheet_data *sheets, const int count, const bool zip, const int delimiter_argument,
+                   const int append_argument = -1) {
         if (!has_privs_of_role(GetUserId(), ROLE_PG_WRITE_SERVER_FILES))
             ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("%s: permission denied to write a file", function),
                             errdetail("Only roles with the privileges of the \"pg_write_server_files\" role may, as with COPY to a file.")));
@@ -1000,7 +1087,8 @@ namespace {
         int64 rows = 0;
         for (int i = 0; i < count; ++i) rows += static_cast<int64>(sheets[i].rows);
         sc_pglib::pending_error error;
-        write_csv(path, sheets, count, delimiter, zip, error);
+        const bool append = append_argument >= 0 && PG_NARGS() > append_argument && PG_GETARG_BOOL(append_argument);
+        write_csv(path, sheets, count, delimiter, zip, append, error);
         error.raise();
         PG_RETURN_INT64(rows);
     }
@@ -1028,14 +1116,14 @@ extern "C" Datum sc_csv_query(PG_FUNCTION_ARGS) {
     return make_csv(fcinfo, "sc_csv", one_query("csv", text_to_cstring(PG_GETARG_TEXT_PP(1))), 1, false, 2);
 }
 
-// sc_csvzip(path text, query text, entry text, delimiter text) -> bigint
+// sc_csvzip(path text, query text, entry text, delimiter text, append boolean) -> bigint
 extern "C" Datum sc_csvzip_query(PG_FUNCTION_ARGS) {
     const char *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
     const char *entry = csv_entry(path, PG_NARGS() > 2 ? text_to_cstring(PG_GETARG_TEXT_PP(2)) : "");
-    return make_csv(fcinfo, "sc_csvzip", one_query(entry, text_to_cstring(PG_GETARG_TEXT_PP(1))), 1, true, 3);
+    return make_csv(fcinfo, "sc_csvzip", one_query(entry, text_to_cstring(PG_GETARG_TEXT_PP(1))), 1, true, 3, 4);
 }
 
-// sc_csvzip(path text, files json or jsonb, delimiter text) -> bigint: a file per query
+// sc_csvzip(path text, files json or jsonb, delimiter text, append boolean) -> bigint: a file per query
 extern "C" Datum sc_csvzip_files(PG_FUNCTION_ARGS) {
     const char *json = nullptr;
     if (get_fn_expr_argtype(fcinfo->flinfo, 1) == JSONBOID) {
@@ -1048,34 +1136,32 @@ extern "C" Datum sc_csvzip_files(PG_FUNCTION_ARGS) {
     sc_pglib::pending_error error;
     const int count = read_entries(json, sheets, error);
     error.raise();
-    return make_csv(fcinfo, "sc_csvzip", sheets, count, true, 2);
+    return make_csv(fcinfo, "sc_csvzip", sheets, count, true, 2, 3);
 }
 
-// sc_read_csvzip(path text, entry text, from_row integer, delimiter text) -> SETOF record
+// sc_read_csvzip(path text, entry text, from_row integer, delimiter text, encoding text) -> SETOF record
 extern "C" Datum sc_read_csvzip_rows(PG_FUNCTION_ARGS) {
     const char *path = readable_path(fcinfo, "sc_read_csvzip");
     const char *entry = text_to_cstring(PG_GETARG_TEXT_PP(1));
     const int from_row = PG_NARGS() > 2 ? PG_GETARG_INT32(2) : 1;
     if (from_row < 1) ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("sc_read_csvzip: rows are numbered from 1, not %d", from_row)));
     const char delimiter = PG_NARGS() > 3 ? delimiter_of(text_to_cstring(PG_GETARG_TEXT_PP(3)), "sc_read_csvzip", true) : '\0';
+    const char *encoding = PG_NARGS() > 4 ? text_to_cstring(PG_GETARG_TEXT_PP(4)) : "";
     const column_plan plan = plan_columns(fcinfo, "sc_read_csvzip");
     read_rows data;
-    sc_pglib::pending_error error;
-    read_csvzip_rows(path, entry, delimiter, from_row, data, error);
-    error.raise();
+    read_csv_file("sc_read_csvzip", path, entry, encoding, delimiter, from_row, data);
     return put_rows(fcinfo, "sc_read_csvzip", plan, data);
 }
 
-// sc_read_csv(path text, from_row integer, delimiter text) -> SETOF record
+// sc_read_csv(path text, from_row integer, delimiter text, encoding text) -> SETOF record
 extern "C" Datum sc_read_csv_rows(PG_FUNCTION_ARGS) {
     const char *path = readable_path(fcinfo, "sc_read_csv");
     const int from_row = PG_NARGS() > 1 ? PG_GETARG_INT32(1) : 1;
     if (from_row < 1) ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("sc_read_csv: rows are numbered from 1, not %d", from_row)));
     const char delimiter = PG_NARGS() > 2 ? delimiter_of(text_to_cstring(PG_GETARG_TEXT_PP(2)), "sc_read_csv", true) : '\0';
+    const char *encoding = PG_NARGS() > 3 ? text_to_cstring(PG_GETARG_TEXT_PP(3)) : "";
     const column_plan plan = plan_columns(fcinfo, "sc_read_csv");
     read_rows data;
-    sc_pglib::pending_error error;
-    read_csv_rows(path, delimiter, from_row, data, error);
-    error.raise();
+    read_csv_file("sc_read_csv", path, nullptr, encoding, delimiter, from_row, data);
     return put_rows(fcinfo, "sc_read_csv", plan, data);
 }
