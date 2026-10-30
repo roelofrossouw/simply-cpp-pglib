@@ -60,7 +60,7 @@ if [ "$major" -ge 18 ]; then
     check_extension=1
 else
     echo "PostgreSQL $major: running the extension scripts directly (CREATE EXTENSION of an uninstalled extension needs 18)"
-    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql; do
+    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql sc_pglib--1.7--1.8.sql; do
         sed -e '/^\\echo/d' -e "s|MODULE_PATHNAME|$library|g" "$sql_dir/$step" | psql_run
     done
     check_extension=0
@@ -210,6 +210,11 @@ check "~the path must be absolute" "select sc_csv('relative.csv', 'select 1')"
 check "~sc_csv: its query returns no rows" "select sc_csv('$work/x.csv', 'create temp table sc_pglib_c (a int)')"
 check "~sc_read_csv: \"$work/missing.csv\"" "select * from sc_read_csv('$work/missing.csv') as x(a text)"
 check "" "create role sc_pglib_writer"
+# sc_mkdir: only under /var/www/data/output (its making is tested by test-folders), revoked from PUBLIC
+check "~isn't /var/www/data/output or a folder in it" "select sc_mkdir('$work/x')"
+check "~\"..\" part" "select sc_mkdir('/var/www/data/output/a/../../x')"
+check "~isn't an absolute path" "select sc_mkdir('output/x')"
+check "f" "select has_function_privilege('sc_pglib_writer', 'sc_mkdir(text)', 'execute')"
 check "~permission denied to read a file" "set role sc_pglib_writer; select sc_read_xlsx('$work/one.xlsx')"
 check "~permission denied to read a file" "set role sc_pglib_writer; select * from sc_read_xlsx('$work/one.xlsx', 1) as x(a text)"
 check "~permission denied to read a file" "set role sc_pglib_writer; select * from sc_xlsx_sheets('$work/one.xlsx')"
@@ -323,14 +328,14 @@ else
 fi
 
 if [ "$check_extension" = 1 ]; then
-    check "sc_pglib|1.7" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.8" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "" "set client_min_messages = warning; drop extension sc_pglib cascade"
-    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_xlsx_sheets', 'sc_csv', 'sc_read_csv'))"
+    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_mkdir', 'sc_xlsx_sheets', 'sc_csv', 'sc_read_csv'))"
     # Updating from 1.0, as an existing database does.
     check "" "create extension sc_pglib version '1.0'"
     check "f" "select exists (select 1 from pg_proc where proname = 'sc_redis_get')"
     check "" "alter extension sc_pglib update"
-    check "sc_pglib|1.7" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.8" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_redis')"
     check "t" "select exists (select 1 from pg_proc where proname = 'sc_redis_hgetall')"
     check "2" "select count(*) from pg_proc where proname = 'sc_redis_sadd'"

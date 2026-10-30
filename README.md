@@ -153,6 +153,32 @@ SELECT * FROM sc_read_csv('/var/www/data/input/prices.csv', delimiter => ';') AS
 
 Since extension 1.7.
 
+## Folders
+
+`sc_mkdir` makes a folder and its missing parents, as `mkdir -p` does, but only in
+`/var/www/data/output` and below. That place is compiled in: no setting changes it. A database
+function can then make the folder it writes a file into without running a program (`copy ... to
+program 'mkdir -p ...'`, which needs `pg_execute_server_program`).
+
+```sql
+PERFORM sc_mkdir('/var/www/data/output/omart/2026/Oct/');   -- '/var/www/data/output/omart/2026/Oct'
+```
+
+| Function | Returns | Notes |
+|---|---|---|
+| `sc_mkdir(path text)` | `text` | the folder, without a trailing slash |
+
+- The path is absolute, `/var/www/data/output` or a folder in it, with no empty, `.` or `..`
+  parts (one trailing slash is fine). A folder that's there already is fine; a file in the
+  way isn't. Anything else is an error that names the path.
+- Nothing on the way may be a symbolic link: each part is opened without following one, so
+  no link, planted before or while it runs, can lead out of the folder.
+- Folders it makes are `0755` whatever the server's umask (PostgreSQL's 0077 made `mkdir -p`
+  give `0700`), and belong to the server's operating system user. Folders that are there keep
+  their mode.
+- `EXECUTE` is revoked from `PUBLIC`: `GRANT EXECUTE ON FUNCTION sc_mkdir(text) TO ...` the
+  roles that need it.
+
 ## Redis
 
 `sc_pglib` talks to Redis (standalone or Cluster) through `sc::redis`, mainly
@@ -234,7 +260,7 @@ How it behaves:
 
 - The module (`sc_pglib.so`, or `sc_pglib.dylib` on macOS) is a PostgreSQL
   loadable module using the version-1 calling convention: `src/sc_pglib.cpp`
-  (base64), `src/sc_redis.cpp` (Redis) and `src/sc_xlsx.cpp` (Excel workbooks and CSV files),
+  (base64), `src/sc_redis.cpp` (Redis), `src/sc_xlsx.cpp` (Excel workbooks and CSV files) and `src/sc_mkdir.cpp` with `src/folders.cpp` (folders),
   linking `sc::sc-redis` and `sc::sc-core` statically, and hiredis and
   sc-office's shared library dynamically. `src/pg_glue.h` has the rules
   for mixing C++ and PostgreSQL: C++ exceptions never reach PostgreSQL, and
@@ -242,11 +268,11 @@ How it behaves:
   because `ereport()` `longjmp()`s past destructors.
 - `sql/sc_pglib.control` and the `sql/sc_pglib--*.sql` scripts are what `CREATE
   EXTENSION` reads: `sc_pglib--1.0.sql` (base64) and the updates `1.0--1.1`
-  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`), `1.4--1.5` (`sc_read_xlsx`), `1.5--1.6` (sheets as rows, `sc_xlsx_sheets`) and `1.6--1.7` (`sc_csv`, `sc_read_csv`). They and the module install into the server's own directories
+  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`), `1.4--1.5` (`sc_read_xlsx`), `1.5--1.6` (sheets as rows, `sc_xlsx_sheets`) `1.6--1.7` (`sc_csv`, `sc_read_csv`) and `1.7--1.8` (`sc_mkdir`). They and the module install into the server's own directories
   (`pg_config --sharedir`/extension and `--pkglibdir`).
-- The extension version (`1.7`) is separate from the package version. A package
+- The extension version (`1.8`) is separate from the package version. A package
   update replaces the module in place; adding or changing SQL objects needs a new
-  extension version with an update script (`sc_pglib--1.7--1.8.sql`), after which
+  extension version with an update script (`sc_pglib--1.8--1.9.sql`), after which
   databases run `ALTER EXTENSION sc_pglib UPDATE`.
 
 ## Building

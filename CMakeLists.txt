@@ -93,7 +93,7 @@ message(STATUS "Building for ${SC_PGLIB_PG_VERSION} (${SC_PGLIB_PG_CONFIG})")
 # A module PostgreSQL loads with dlopen(), so no "lib" prefix and no link against the server:
 # its symbols resolve at load time. macOS needs that said explicitly, and PostgreSQL 16 and
 # later look for ".dylib" there.
-add_library(sc_pglib MODULE src/sc_pglib.cpp src/sc_redis.cpp src/sc_xlsx.cpp)
+add_library(sc_pglib MODULE src/sc_pglib.cpp src/sc_redis.cpp src/sc_xlsx.cpp src/sc_mkdir.cpp src/folders.cpp)
 target_include_directories(sc_pglib PRIVATE "${SC_PGLIB_PG_INCLUDEDIR}")
 # sc::sc-redis brings sc::sc-core (base64) with it.
 target_link_libraries(sc_pglib PRIVATE sc::sc-redis)
@@ -108,7 +108,7 @@ if (APPLE)
     endif ()
 endif ()
 
-set(SC_PGLIB_EXTENSION_FILES sql/sc_pglib.control sql/sc_pglib--1.0.sql sql/sc_pglib--1.0--1.1.sql sql/sc_pglib--1.1--1.2.sql sql/sc_pglib--1.2--1.3.sql sql/sc_pglib--1.3--1.4.sql sql/sc_pglib--1.4--1.5.sql sql/sc_pglib--1.5--1.6.sql sql/sc_pglib--1.6--1.7.sql)
+set(SC_PGLIB_EXTENSION_FILES sql/sc_pglib.control sql/sc_pglib--1.0.sql sql/sc_pglib--1.0--1.1.sql sql/sc_pglib--1.1--1.2.sql sql/sc_pglib--1.2--1.3.sql sql/sc_pglib--1.3--1.4.sql sql/sc_pglib--1.4--1.5.sql sql/sc_pglib--1.5--1.6.sql sql/sc_pglib--1.6--1.7.sql sql/sc_pglib--1.7--1.8.sql)
 if (SC_PGLIB_INSTALL)
     install(TARGETS sc_pglib LIBRARY DESTINATION "${SC_PGLIB_PG_PKGLIBDIR}" COMPONENT runtime)
     install(FILES ${SC_PGLIB_EXTENSION_FILES} DESTINATION "${SC_PGLIB_PG_SHAREDIR}/extension" COMPONENT runtime)
@@ -125,6 +125,11 @@ if (SC_PGLIB_BUILD_TESTS)
             COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/extension.sh"
             "$<TARGET_FILE:sc_pglib>" "${CMAKE_CURRENT_SOURCE_DIR}/sql/sc_pglib--1.0.sql" "${SC_PGLIB_PG_BINDIR}")
     set_tests_properties(test-extension PROPERTIES SKIP_RETURN_CODE 77 LABELS database TIMEOUT 120)
+    # The folder walk on its own, in a scratch folder tree.
+    add_executable(test-folders tests/folders.cpp src/folders.cpp)
+    target_include_directories(test-folders PRIVATE src tests)
+    add_test(NAME test-folders COMMAND test-folders)
+    set_tests_properties(test-folders PROPERTIES LABELS unit)
 endif ()
 
 #############
