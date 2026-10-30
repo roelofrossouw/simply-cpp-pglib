@@ -8,12 +8,18 @@
 //   sc_xlsx(path, '{"Sheet": "query", ...}'::json or ::jsonb)
 //                                      a sheet per query: json keeps them in the order written,
 //                                      jsonb sorts its keys (shorter first)
+//   sc_xlsx(path, query, sheet, formatting json)
+//   sc_xlsx(path, sheets, formatting json)
+//                                      formatted (xlsx_format.h; README.md, "Formatting a sheet"):
+//                                      formatting for every sheet, a sheet given as {"query": "...",
+//                                      ...} with its own keys over it
 //
 // Each sheet has the columns' names in a bold first row, kept in view (frozen), then a row per
 // row: numbers (integers, float, numeric, oid) as numbers, booleans as booleans, date, timestamp,
 // timestamptz (in the session's time zone) and time as Excel's dates and times with a matching
 // format, NULL as an empty cell, anything else as its text. Columns are as wide as their contents
-// (up to 80 characters). Returns how many rows were written, all sheets together.
+// (up to 80 characters), unless formatting says otherwise. Returns how many rows were written, all
+// sheets together.
 //
 // sc_read_xlsx(path) reads one back as json: {"Sheet": [[cell, ...], ...], ...}, each sheet an array
 // of its rows from the first, each row its cells from column A up to its last one set (an empty
@@ -77,6 +83,7 @@
 #include <vector>
 
 #include "pg_glue.h"
+#include "xlsx_format.h"
 
 extern "C" {
 #include <catalog/pg_authid.h>
@@ -122,31 +129,66 @@ namespace {
     struct sheet_data {
         const char *name = nullptr;
         const char *query = nullptr;
+        const char *format = nullptr; // its format's json, checked (xlsx_format.h); nullptr: none
         int columns = 0;
         const char **headers = nullptr;
         uint64 rows = 0;
         cell_data *cells = nullptr; // rows * columns
     };
 
-    // The sheets and their queries from the arguments, checked as Excel checks sheet names, into
-    // sheets (allocated in the current context). Never raises.
-    int read_sheets(const std::string_view single_query, const std::string_view single_sheet, const char *sheets_json, sheet_data *&sheets,
-                    sc_pglib::pending_error &error) noexcept {
+    // The sheets, their queries and formats from the arguments, checked as Excel checks sheet names,
+    // into sheets (allocated in the current context): a sheet's format is format_json's (for all
+    // sheets) with its own over it. Never raises.
+    int read_sheets(const std::string_view single_query, const std::string_view single_sheet, const char *sheets_json, const char *format_json,
+                    sheet_data *&sheets, sc_pglib::pending_error &error) noexcept {
         try {
-            std::vector<std::pair<std::string, std::string>> wanted;
+            struct wanted_sheet {
+                std::string name, query, format;
+            };
+            std::vector<wanted_sheet> wanted;
+            nlohmann::ordered_json common;
+            if (format_json) {
+                try {
+                    common = nlohmann::ordered_json::parse(format_json);
+                } catch (const nlohmann::json::parse_error &problem) {
+                    throw std::invalid_argument(std::string{"format: "} + problem.what());
+                }
+            }
+            const auto format_of = [](const std::string &name, const nlohmann::ordered_json &format) {
+                if (format.is_null()) return std::string{};
+                try {
+                    (void) sc_pglib::xlsx::sheet_format::read(format);
+                } catch (const std::invalid_argument &problem) {
+                    throw std::invalid_argument("sheet \"" + name + "\": " + problem.what());
+                }
+                return format.dump();
+            };
             if (sheets_json) {
                 const auto parsed = nlohmann::ordered_json::parse(sheets_json);
                 if (!parsed.is_object() || parsed.empty())
                     throw std::invalid_argument(R"(sheets are a JSON object of sheet names and their queries: {"Sheet": "select ..."})");
-                for (const auto &[name, query]: parsed.items()) {
-                    if (!query.is_string()) throw std::invalid_argument("sheet \"" + name + "\": its query isn't text");
-                    wanted.emplace_back(name, query.get<std::string>());
+                for (const auto &[name, sheet]: parsed.items()) {
+                    // "select ...", or {"query": "select ...", and its format's keys}
+                    nlohmann::ordered_json own;
+                    std::string query;
+                    if (sheet.is_object()) {
+                        if (!sheet.contains("query") || !sheet["query"].is_string())
+                            throw std::invalid_argument("sheet \"" + name + R"(": its object has no "query" text ({"query": "select ...", "freeze_panes": "B2"}))");
+                        query = sheet["query"].get<std::string>();
+                        own = sheet;
+                        own.erase("query");
+                    } else if (sheet.is_string()) {
+                        query = sheet.get<std::string>();
+                    } else {
+                        throw std::invalid_argument("sheet \"" + name + "\": its query isn't text");
+                    }
+                    wanted.push_back({name, query, format_of(name, sc_pglib::xlsx::merged(common, own))});
                 }
             } else {
-                wanted.emplace_back(std::string{single_sheet}, std::string{single_query});
+                wanted.push_back({std::string{single_sheet}, std::string{single_query}, format_of(std::string{single_sheet}, common)});
             }
             sc::office::excel::workbook names; // checks each name (length, characters, used already)
-            for (const auto &[name, query]: wanted) {
+            for (const auto &[name, query, format]: wanted) {
                 (void) names.add(name);
                 if (query.find_first_not_of(" \t\r\n") == std::string::npos) throw std::invalid_argument("sheet \"" + name + "\": its query is empty");
             }
@@ -154,8 +196,9 @@ namespace {
             if (!sheets) return 0;
             for (std::size_t i = 0; i < wanted.size(); ++i) {
                 sheets[i] = sheet_data{};
-                sheets[i].name = sc_pglib::new_cstring(wanted[i].first, error);
-                sheets[i].query = sc_pglib::new_cstring(wanted[i].second, error);
+                sheets[i].name = sc_pglib::new_cstring(wanted[i].name, error);
+                sheets[i].query = sc_pglib::new_cstring(wanted[i].query, error);
+                if (!wanted[i].format.empty()) sheets[i].format = sc_pglib::new_cstring(wanted[i].format, error);
                 if (error.any()) return 0;
             }
             return static_cast<int>(wanted.size());
@@ -253,34 +296,97 @@ namespace {
         return n;
     }
 
+    // A sheet's format applied to what's written: the header (row 0, when there is one) and the
+    // data under it, in columns 0 to data.columns - 1. widths are the ones found for the contents.
+    void apply_format(sc::office::excel::sheet &sheet, const sc_pglib::xlsx::sheet_format &format, const sheet_data &data,
+                      std::vector<std::size_t> &widths) {
+        using sc_pglib::xlsx::target;
+        const std::size_t first_data = format.header ? 1 : 0, rows = first_data + data.rows, columns = static_cast<std::size_t>(data.columns);
+        std::vector<std::optional<double>> width(columns); // the ones given; auto otherwise
+        std::vector<bool> given(columns, false);
+        // What change does over the block clipped to what's written, and to its columns or rows.
+        const auto over = [&](const sc_pglib::xlsx::change &change, const std::size_t first_row, const std::size_t last_row, const std::size_t first_column,
+                              const std::size_t last_column, const bool whole_columns, const bool whole_rows) {
+            if (columns == 0) return;
+            if (change.styles())
+                for (auto r = first_row; r <= last_row && r < rows; ++r)
+                    for (auto c = first_column; c <= last_column && c < columns; ++c) change.apply(sheet[{r, c}].style);
+            if (whole_columns)
+                for (auto c = first_column; c <= last_column && c < columns; ++c) {
+                    if (change.width) width[c] = *change.width, given[c] = true;
+                    if (change.hidden) sheet.hidden_column(c, *change.hidden);
+                }
+            if (whole_rows)
+                for (auto r = first_row; r <= last_row && r < rows; ++r) {
+                    if (change.height) sheet.height(r, *change.height);
+                    if (change.hidden) sheet.hidden_row(r, *change.hidden);
+                }
+        };
+        if (rows > 0) over(format.style, 0, rows - 1, 0, columns - 1, false, false);
+        if (format.header) over(format.header_style, 0, 0, 0, columns - 1, false, false);
+        for (const auto &[name, change]: format.columns) {
+            int found = -1;
+            for (int c = 0; c < data.columns && found < 0; ++c)
+                if (name == data.headers[c]) found = c;
+            if (found < 0) {
+                std::string names;
+                for (int c = 0; c < data.columns; ++c) names += (c ? ", " : "") + std::string{data.headers[c]};
+                throw std::invalid_argument("format.columns: the query has no column \"" + name + "\" (it has " + (names.empty() ? "none" : names) + ")");
+            }
+            const auto c = static_cast<std::size_t>(found);
+            if (rows > first_data) over(change, first_data, rows - 1, c, c, false, false);
+            over(sc_pglib::xlsx::change{.width = change.width, .hidden = change.hidden}, 0, 0, c, c, true, false);
+        }
+        for (const auto &[cells, change]: format.format)
+            over(change, cells.first_row, cells.last_row, cells.first_column, cells.last_column, cells.is == target::kind::columns,
+                 cells.is == target::kind::rows);
+        for (std::size_t c = 0; c < columns; ++c) {
+            if (given[c] && width[c]) sheet.width(c, *width[c]);
+            else if (given[c] || format.auto_width) sheet.width(c, static_cast<double>(std::clamp<std::size_t>(widths[c] + 2, 8, 80)));
+        }
+        if (format.freeze) {
+            if (*format.freeze) sheet.freeze(**format.freeze);
+        } else if (format.header && columns > 0) {
+            sheet.freeze("A2");
+        }
+        if (format.filter) sheet.filter(*format.filter);
+        else if (format.filter_data && columns > 0) sheet.filter(sc::office::excel::range{sc::office::excel::address{0, 0}, sc::office::excel::address{std::max<std::size_t>(rows, 1) - 1, columns - 1}});
+    }
+
     // The workbook made from the sheets and written to path, then made readable by all. Never raises.
     void write_workbook(const char *path, const sheet_data *sheets, const int count, sc_pglib::pending_error &error) noexcept {
+        const char *sheet_name = "";
         try {
             using namespace sc::office;
             excel::workbook book;
             for (int s = 0; s < count; ++s) {
                 const auto &data = sheets[s];
+                sheet_name = data.name;
+                const auto format = sc_pglib::xlsx::sheet_format::read(data.format ? sc_pglib::xlsx::json::parse(data.format) : sc_pglib::xlsx::json{});
                 auto &sheet = book.add(data.name);
+                const std::size_t first_data = format.header ? 1 : 0;
                 std::vector<std::size_t> widths(data.columns, 0);
-                for (int c = 0; c < data.columns; ++c) {
-                    auto &cell = sheet[{0, static_cast<std::size_t>(c)}];
-                    cell = std::string{data.headers[c]};
-                    cell.style.font.bold = true;
-                    widths[c] = shown_length(data.headers[c]);
+                if (format.header) {
+                    for (int c = 0; c < data.columns; ++c) {
+                        auto &cell = sheet[{0, static_cast<std::size_t>(c)}];
+                        cell = std::string{data.headers[c]};
+                        cell.style.font.bold = true;
+                        widths[c] = shown_length(data.headers[c]);
+                    }
                 }
                 for (uint64 r = 0; r < data.rows; ++r) {
                     for (int c = 0; c < data.columns; ++c) {
                         const auto &from = data.cells[r * data.columns + c];
                         if (from.is == kind::empty) continue;
-                        auto &cell = sheet[{static_cast<std::size_t>(r + 1), static_cast<std::size_t>(c)}];
+                        auto &cell = sheet[{static_cast<std::size_t>(r + first_data), static_cast<std::size_t>(c)}];
                         std::size_t width = 0;
                         switch (from.is) {
                             case kind::number:
                                 cell = from.number;
                                 switch (from.as) {
-                                    case shown::date: cell.style.number_format = "yyyy-mm-dd"; width = 10; break;
-                                    case shown::date_time: cell.style.number_format = "yyyy-mm-dd hh:mm:ss"; width = 19; break;
-                                    case shown::time: cell.style.number_format = "hh:mm:ss"; width = 8; break;
+                                    case shown::date: cell.style.number_format = format.date; width = std::max<std::size_t>(10, format.date.size()); break;
+                                    case shown::date_time: cell.style.number_format = format.date_time; width = std::max<std::size_t>(19, format.date_time.size()); break;
+                                    case shown::time: cell.style.number_format = format.time; width = std::max<std::size_t>(8, format.time.size()); break;
                                     case shown::plain: width = std::min<std::size_t>(15, std::to_string(from.number).find('.') + 3); break;
                                 }
                                 break;
@@ -297,11 +403,13 @@ namespace {
                         widths[c] = std::max(widths[c], width);
                     }
                 }
-                for (int c = 0; c < data.columns; ++c) sheet.width(static_cast<std::size_t>(c), static_cast<double>(std::clamp<std::size_t>(widths[c] + 2, 8, 80)));
-                if (data.columns > 0) sheet.freeze("A2");
+                apply_format(sheet, format, data, widths);
             }
+            sheet_name = "";
             excel::write(book, path);
             if (::chmod(path, 0644) != 0) error.set(ERRCODE_IO_ERROR, WARNING, "sc_xlsx: could not make \"%s\" readable by all: %m", path);
+        } catch (const std::invalid_argument &problem) {
+            error.set(ERRCODE_INVALID_PARAMETER_VALUE, ERROR, "sc_xlsx: sheet \"%s\": %s", sheet_name, problem.what());
         } catch (const std::exception &problem) {
             error.set(ERRCODE_IO_ERROR, ERROR, "sc_xlsx: \"%s\": %s", path, problem.what());
         } catch (...) {
@@ -309,7 +417,7 @@ namespace {
         }
     }
 
-    Datum make_xlsx(FunctionCallInfo fcinfo, const char *sheets_json, const std::string_view query, const std::string_view sheet_name) {
+    Datum make_xlsx(FunctionCallInfo fcinfo, const char *sheets_json, const char *format_json, const std::string_view query, const std::string_view sheet_name) {
         if (!has_privs_of_role(GetUserId(), ROLE_PG_WRITE_SERVER_FILES))
             ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("sc_xlsx: permission denied to write a file"),
                             errdetail("Only roles with the privileges of the \"pg_write_server_files\" role may, as with COPY to a file.")));
@@ -318,7 +426,7 @@ namespace {
 
         sc_pglib::pending_error error;
         sheet_data *sheets = nullptr;
-        const int count = read_sheets(query, sheet_name, sheets_json, sheets, error);
+        const int count = read_sheets(query, sheet_name, sheets_json, format_json, sheets, error);
         error.raise();
 
         const MemoryContext outer = CurrentMemoryContext;
@@ -752,14 +860,16 @@ extern "C" Datum sc_read_xlsx(PG_FUNCTION_ARGS) {
     PG_RETURN_POINTER(result);
 }
 
-// sc_xlsx(path text, query text [, sheet text]) -> bigint
+// sc_xlsx(path text, query text [, sheet text [, format json]]) -> bigint
 extern "C" Datum sc_xlsx_query(PG_FUNCTION_ARGS) {
     const char *query = text_to_cstring(PG_GETARG_TEXT_PP(1));
     const char *sheet = PG_NARGS() > 2 ? text_to_cstring(PG_GETARG_TEXT_PP(2)) : "Sheet1";
-    return make_xlsx(fcinfo, nullptr, query, sheet);
+    const char *format = PG_NARGS() > 3 ? text_to_cstring(PG_GETARG_TEXT_PP(3)) : nullptr;
+    return make_xlsx(fcinfo, nullptr, format, query, sheet);
 }
 
-// sc_xlsx(path text, sheets json or jsonb) -> bigint: json is text already; jsonb is written out.
+// sc_xlsx(path text, sheets json or jsonb [, format json]) -> bigint: json is text already; jsonb is
+// written out.
 extern "C" Datum sc_xlsx_sheets(PG_FUNCTION_ARGS) {
     const char *json = nullptr;
     if (get_fn_expr_argtype(fcinfo->flinfo, 1) == JSONBOID) {
@@ -768,7 +878,8 @@ extern "C" Datum sc_xlsx_sheets(PG_FUNCTION_ARGS) {
     } else {
         json = text_to_cstring(PG_GETARG_TEXT_PP(1));
     }
-    return make_xlsx(fcinfo, json, {}, {});
+    const char *format = PG_NARGS() > 2 ? text_to_cstring(PG_GETARG_TEXT_PP(2)) : nullptr;
+    return make_xlsx(fcinfo, json, format, {}, {});
 }
 
 namespace {

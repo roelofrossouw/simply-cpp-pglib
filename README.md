@@ -74,6 +74,9 @@ SELECT sc_xlsx('/var/www/data/output/result.xlsx',
 | `sc_xlsx(path text, query text, sheet text)` | `bigint` | one sheet, named |
 | `sc_xlsx(path text, sheets json)` | `bigint` | a sheet per query, in the order written |
 | `sc_xlsx(path text, sheets jsonb)` | `bigint` | the same; jsonb sorts its keys (shorter first) |
+| `sc_xlsx(path text, query text, sheet text, formatting json)` | `bigint` | one sheet, formatted (below); since 1.11 |
+| `sc_xlsx(path text, sheets json, formatting json)` | `bigint` | a sheet per query, `formatting` for all of them, a sheet's own over it |
+| `sc_xlsx(path text, sheets jsonb, formatting json)` | `bigint` | the same |
 
 - The rule is COPY's: only superusers and roles with the privileges of
   `pg_write_server_files` may, and the path is absolute. The file is written as
@@ -92,6 +95,119 @@ SELECT sc_xlsx('/var/www/data/output/result.xlsx',
 - Give the sheets as `json` or `jsonb` explicitly: an untyped string is taken
   as a query.
 - The rows are held in memory until the file is written.
+
+### Formatting a sheet
+
+`formatting` is a JSON object of how a sheet looks. Without it (or with `{}`) a sheet looks as
+above: a bold header, frozen, dates in ISO, columns as wide as their contents.
+
+```sql
+SELECT sc_xlsx('/var/www/data/output/invoices.xlsx',
+               'select number, customer, issued, amount, paid from invoices', 'Invoices',
+               '{"freeze_panes": "B2",
+                 "autofilter": true,
+                 "style": {"font": "Arial", "font_size": 10},
+                 "header_style": {"background": "#1f4e79", "color": "white", "border_bottom": "medium"},
+                 "columns": {"amount": "currency", "customer": {"width": 40}},
+                 "format": {"C": {"number_format": "dd mmm yyyy", "align": "center"},
+                            "E2:E999": {"color": "#00b050", "bold": true},
+                            "1": {"height": 24, "valign": "center"}}}');
+```
+
+The sheet's own settings:
+
+| Key | Value | Default |
+|---|---|---|
+| `header` | `true` or `false`: the columns' names as the first row | `true` |
+| `freeze_panes` | the first cell that scrolls: `"B2"` keeps row 1 and column A in view, `"A3"` two rows, `"B1"` one column; `false` freezes nothing | `"A2"` with a header, else nothing |
+| `autofilter` | `true`: filter buttons on the header, over all the rows; a range (`"A1:F20"`) for that one; `false` | `false` |
+| `auto_width` | `true`: columns as wide as their contents (8 to 80 characters); `false`: Excel's default width, except where a width is given | `true` |
+| `date_format`, `datetime_format`, `time_format` | the number format of `date`, `timestamp`/`timestamptz` and `time` columns | `"yyyy-mm-dd"`, `"yyyy-mm-dd hh:mm:ss"`, `"hh:mm:ss"` |
+| `currency_symbol` | the symbol the `currency` and `accounting` formats show, up to 10 characters | `"R "` |
+| `style` | a style (below) for every cell written | |
+| `header_style` | a style for the header, over the bold it has | |
+| `columns` | `{"column name": style}`: the query's columns by name, their data (not the header) | |
+| `format` | `{"place": style}`: cells, columns or rows by Excel's names | |
+
+A **place** in `format` is a cell (`"B2"`), a range (`"F2:F999"`), whole columns (`"C"`, `"C:E"`)
+or whole rows (`"1"`, `"2:5"`), in any case. Places count the header: with one, the data starts in
+row 2. Only what's written is styled: a place reaching past the last row or column stops there, so
+`"F2:F999"` and `"F"` (with its header) style column F however many rows there are. `columns`
+follows the query's own names, so it keeps up when the columns move; it styles the data only.
+
+A **style** is a number format on its own (`"currency"`), or an object of what it changes; only
+what it names changes, so styles add up:
+
+| Key | Value |
+|---|---|
+| `number_format` | a name below, or Excel's own code (`"0.0%"`, `"#,##0 \"kg\""`, `"[Red]-0.00;0.00"`) |
+| `font` | the font's family: `"Arial"`, `"Courier New"` (1 to 31 characters); Calibri otherwise |
+| `font_size` | in points, 1 to 409 (Excel's default is 11) |
+| `bold`, `italic`, `strike` | `true` or `false` |
+| `underline` | `true` (single), `false`, `"double"`, `"single_accounting"`, `"double_accounting"` |
+| `color` | the text's colour: `"#c00000"`, `"#c00"` or a CSS name (`"red"`, `"darkblue"`, `"lightgray"`) |
+| `background` | a solid fill, the same way; `null` for none |
+| `border` | all four sides: a line (`"thin"`), `true` (thin), `false` (none), or `{"line": "medium", "color": "#999999"}` |
+| `border_top`, `border_bottom`, `border_left`, `border_right` | one side, the same way |
+| `align` | `"left"`, `"center"`, `"right"`, `"fill"`, `"justify"`, `"center_across"` (across this and the empty cells to its right), `"distributed"`, `"general"` (text left, numbers right) |
+| `valign` | `"top"`, `"center"`, `"bottom"`, `"justify"`, `"distributed"` |
+| `wrap` | `true`: text wraps onto more lines |
+| `indent` | 0 to 250 steps (about three characters each) |
+| `rotation` | degrees, -90 (reading down) to 90 (reading up) |
+| `width` | columns only (`"C"`, `"C:E"`, or a name in `columns`): characters, 0 to 255, or `"auto"` |
+| `height` | rows only (`"1"`, `"2:5"`): points, 0 to 409 |
+| `hidden` | whole columns or rows: `true` hides them |
+
+Lines are `thin`, `medium`, `thick`, `hair`, `dotted`, `dashed`, `double`, `dash_dot`,
+`dash_dot_dot`, `slant_dash_dot`, `medium_dashed`, `medium_dash_dot`, `medium_dash_dot_dot` and
+`none`.
+
+The **number formats** by name:
+
+| Name | Code | Shows |
+|---|---|---|
+| `general` | General | as Excel decides |
+| `text` | `@` | as text |
+| `integer` | `0` | 1235 |
+| `thousands` | `#,##0` | 1,235 |
+| `decimal` | `0.00` | 1234.50 |
+| `number` | `#,##0.00` | 1,234.50 |
+| `percent` | `0%` | 15% (of 0.15) |
+| `currency` | `"R "#,##0.00;-"R "#,##0.00` | R 1,234.50 |
+| `accounting` | Excel's accounting, with the symbol | R  1,234.50, the symbol lined up on the left |
+| `date`, `datetime`, `time` | `yyyy-mm-dd`, `yyyy-mm-dd hh:mm:ss`, `hh:mm:ss` | 2026-10-30 |
+
+Anything else is taken as Excel's code, so a misspelt name shows as text in the cell: check new
+formats once in Excel. Separators and the currency's look follow the code, not the reader's
+locale, except the `,` and `.` themselves, which Excel shows in the reader's own way.
+
+**The order** is: what a sheet has by default (the bold header, date formats), then `style`, then
+`header_style`, then `columns`, then `format`, each entry in the order written; a later one wins
+where they meet. That's why `formatting` is `json`, which keeps the order, and not `jsonb`.
+
+**Several sheets**: the `formatting` argument is for every sheet. A sheet whose value is an object
+instead of a query has its query as `query` and its own keys beside it, over the common ones (its
+`columns` and `format` entries are added after the common ones, so they win):
+
+```sql
+SELECT sc_xlsx('/var/www/data/output/month.xlsx',
+               '{"Invoices": {"query": "select number, customer, amount from invoices",
+                              "columns": {"amount": "currency"}},
+                 "Payments": {"query": "select paid_on, reference, amount from payments",
+                              "columns": {"amount": "currency", "reference": {"width": 30}},
+                              "freeze_panes": "B2"},
+                 "Notes": {"query": "select note from notes", "header": false, "freeze_panes": false}}'::json,
+               '{"autofilter": true, "style": {"font": "Arial", "font_size": 10},
+                 "header_style": {"background": "#ddebf7"}}');
+```
+
+A sheet's value can still be just its query, with only the common formatting. Mistakes (a key or
+value that isn't known, a column the query doesn't have) are errors naming the sheet and the key,
+and no file is written:
+
+```
+ERROR:  sc_xlsx: sheet "Payments": format.columns: the query has no column "amout" (it has paid_on, reference, amount)
+```
 
 `sc_read_xlsx` reads one back. A sheet's rows come back as rows, into the columns you name after the
 sheet's column letters, each with the type you want; `row` is the row number:
@@ -271,7 +387,7 @@ How it behaves:
 
 - The module (`sc_pglib.so`, or `sc_pglib.dylib` on macOS) is a PostgreSQL
   loadable module using the version-1 calling convention: `src/sc_pglib.cpp`
-  (base64), `src/sc_redis.cpp` (Redis), `src/sc_xlsx.cpp` (Excel workbooks and CSV files) and `src/sc_mkdir.cpp` with `src/folders.cpp` (folders),
+  (base64), `src/sc_redis.cpp` (Redis), `src/sc_xlsx.cpp` (Excel workbooks and CSV files), `src/xlsx_format.cpp` (a sheet's formatting) and `src/sc_mkdir.cpp` with `src/folders.cpp` (folders),
   linking `sc::sc-redis` and `sc::sc-core` statically, and hiredis and
   sc-office's shared library dynamically. `src/pg_glue.h` has the rules
   for mixing C++ and PostgreSQL: C++ exceptions never reach PostgreSQL, and
@@ -279,11 +395,11 @@ How it behaves:
   because `ereport()` `longjmp()`s past destructors.
 - `sql/sc_pglib.control` and the `sql/sc_pglib--*.sql` scripts are what `CREATE
   EXTENSION` reads: `sc_pglib--1.0.sql` (base64) and the updates `1.0--1.1`
-  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`), `1.4--1.5` (`sc_read_xlsx`), `1.5--1.6` (sheets as rows, `sc_xlsx_sheets`) `1.6--1.7` (`sc_csv`, `sc_read_csv`), `1.7--1.8` (`sc_mkdir`), `1.8--1.9` (`sc_csvzip`, `sc_read_csvzip`) and `1.9--1.10` (`sc_csvzip` with several files). They and the module install into the server's own directories
+  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`), `1.4--1.5` (`sc_read_xlsx`), `1.5--1.6` (sheets as rows, `sc_xlsx_sheets`) `1.6--1.7` (`sc_csv`, `sc_read_csv`), `1.7--1.8` (`sc_mkdir`), `1.8--1.9` (`sc_csvzip`, `sc_read_csvzip`), `1.9--1.10` (`sc_csvzip` with several files) and `1.10--1.11` (`sc_xlsx` with formatting). They and the module install into the server's own directories
   (`pg_config --sharedir`/extension and `--pkglibdir`).
-- The extension version (`1.10`) is separate from the package version. A package
+- The extension version (`1.11`) is separate from the package version. A package
   update replaces the module in place; adding or changing SQL objects needs a new
-  extension version with an update script (`sc_pglib--1.10--1.11.sql`), after which
+  extension version with an update script (`sc_pglib--1.11--1.12.sql`), after which
   databases run `ALTER EXTENSION sc_pglib UPDATE`.
 
 ## Building

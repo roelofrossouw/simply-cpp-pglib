@@ -60,7 +60,7 @@ if [ "$major" -ge 18 ]; then
     check_extension=1
 else
     echo "PostgreSQL $major: running the extension scripts directly (CREATE EXTENSION of an uninstalled extension needs 18)"
-    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql sc_pglib--1.7--1.8.sql sc_pglib--1.8--1.9.sql sc_pglib--1.9--1.10.sql; do
+    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql sc_pglib--1.7--1.8.sql sc_pglib--1.8--1.9.sql sc_pglib--1.9--1.10.sql sc_pglib--1.10--1.11.sql; do
         sed -e '/^\\echo/d' -e "s|MODULE_PATHNAME|$library|g" "$sql_dir/$step" | psql_run
     done
     check_extension=0
@@ -184,6 +184,43 @@ check 'one' "select * from sc_read_xlsx('$work/empty.xlsx', 1) as x(a text)"
 check "~there's no sheet \"Nope\"" "select * from sc_read_xlsx('$work/one.xlsx', 'Nope') as x(a text)"
 check "~the path must be absolute" "select sc_read_xlsx('one.xlsx')"
 check "~sc_read_xlsx: \"$work/missing.xlsx\"" "select sc_read_xlsx('$work/missing.xlsx')"
+# A format: panes, an AutoFilter, a font for the sheet, the header's colours, number formats and
+# widths by column name, a hidden column, bold bordered cells and a row's height.
+check "3" "select sc_xlsx('$work/styled.xlsx', 'select n as id, n * 10.5 as price, ''item '' || n as name, date ''2026-10-30'' + n as day from generate_series(1, 3) n', 'Prices', '{\"freeze_panes\": \"B2\", \"autofilter\": true, \"date_format\": \"dd mmm yyyy\", \"style\": {\"font\": \"Arial\", \"font_size\": 10}, \"header_style\": {\"background\": \"#1f4e79\", \"color\": \"white\"}, \"columns\": {\"price\": \"currency\", \"name\": {\"width\": 30}}, \"format\": {\"A\": {\"hidden\": true}, \"c2:c3\": {\"bold\": true, \"border\": \"thin\"}, \"4\": {\"height\": 20}}}')"
+styled=$(sheet_xml "$work/styled.xlsx" 1)
+styles=$(unzip -p "$work/styled.xlsx" xl/styles.xml)
+if grep -q 'xSplit="1" ySplit="1" topLeftCell="B2"' <<<"$styled" && grep -q '<autoFilter ref="A1:D4"/>' <<<"$styled" &&
+   grep -q '<col min="1" max="1" width="8" customWidth="1" hidden="1"/>' <<<"$styled" && grep -q '<col min="3" max="3" width="30" customWidth="1"/>' <<<"$styled" &&
+   grep -q '<row r="4" ht="20" customHeight="1">' <<<"$styled" && grep -q '<sz val="10"/><color rgb="FFFFFFFF"/><name val="Arial"/>' <<<"$styles" &&
+   grep -q 'formatCode="&quot;R &quot;#,##0.00;-&quot;R &quot;#,##0.00"' <<<"$styles" && grep -q 'formatCode="dd mmm yyyy"' <<<"$styles" &&
+   grep -q '<fgColor rgb="FF1F4E79"/>' <<<"$styles" && grep -q '<left style="thin">' <<<"$styles" &&
+   unzip -p "$work/styled.xlsx" xl/workbook.xml | grep -q "_xlnm._FilterDatabase\" localSheetId=\"0\" hidden=\"1\">'Prices'!\$A\$1:\$D\$4<"; then
+    echo "ok: styled.xlsx has its panes, AutoFilter, widths, hidden column, row height, font, colours, borders and formats"
+else
+    echo "FAILED: styled.xlsx"; echo "$styled" | head -c 3000; echo; echo "$styles" | head -c 3000; echo; failures=$((failures + 1))
+fi
+check '{"Prices":[["id","price","name","day"],[1,10.5,"item 1","2026-10-31"],[2,21,"item 2","2026-11-01"],[3,31.5,"item 3","2026-11-02"]]}' "select sc_read_xlsx('$work/styled.xlsx')"
+# Several sheets: a format for all of them, a sheet's own keys over it (no header, nothing frozen).
+check "2" "select sc_xlsx('$work/tabs.xlsx', '{\"One\": \"select 1 as a\", \"Two\": {\"query\": \"select 2 as b\", \"header\": false, \"freeze_panes\": false, \"format\": {\"A1\": \"0.00\"}}}'::json, '{\"autofilter\": true, \"style\": {\"font\": \"Courier New\"}, \"format\": {\"A\": {\"width\": 12}}}')"
+if sheet_xml "$work/tabs.xlsx" 1 | grep -q 'ySplit="1"' && sheet_xml "$work/tabs.xlsx" 1 | grep -q '<autoFilter ref="A1:A2"/>' &&
+   ! sheet_xml "$work/tabs.xlsx" 2 | grep -q 'sheetViews' && sheet_xml "$work/tabs.xlsx" 2 | grep -q '<autoFilter ref="A1"/>' &&
+   sheet_xml "$work/tabs.xlsx" 2 | grep -q '<col min="1" max="1" width="12" customWidth="1"/>' &&
+   unzip -p "$work/tabs.xlsx" xl/styles.xml | grep -q '<xf numFmtId="2" ' && unzip -p "$work/tabs.xlsx" xl/styles.xml | grep -q 'name val="Courier New"'; then
+    echo "ok: tabs.xlsx's sheets share the format, the second with its own"
+else
+    echo "FAILED: tabs.xlsx"; sheet_xml "$work/tabs.xlsx" 2 | head -c 2000; echo; failures=$((failures + 1))
+fi
+check '{"One":[["a"],[1]],"Two":[[2]]}' "select sc_read_xlsx('$work/tabs.xlsx')"
+check "1" "select sc_xlsx('$work/tabsb.xlsx', '{\"One\": {\"query\": \"select 1 as a\", \"columns\": {\"a\": \"percent\"}}}'::jsonb, '{}')"
+check "~isn't a sheet's: header, freeze_panes" "select sc_xlsx('$work/x.xlsx', 'select 1', 'S', '{\"colour\": \"red\"}')"
+check "~sheet \"S\": format.format.A1: \"colour\" isn't something to change" "select sc_xlsx('$work/x.xlsx', 'select 1', 'S', '{\"format\": {\"A1\": {\"colour\": \"red\"}}}')"
+check "~only columns have a width" "select sc_xlsx('$work/x.xlsx', 'select 1', 'S', '{\"format\": {\"A1\": {\"width\": 3}}}')"
+check "~\"A1:\" isn't a cell" "select sc_xlsx('$work/x.xlsx', 'select 1', 'S', '{\"format\": {\"A1:\": \"text\"}}')"
+check "~isn't a colour" "select sc_xlsx('$work/x.xlsx', 'select 1', 'S', '{\"style\": {\"color\": \"#12\"}}')"
+check "~isn't a line" "select sc_xlsx('$work/x.xlsx', 'select 1', 'S', '{\"style\": {\"border\": \"wide\"}}')"
+check "~the query has no column \"nope\" (it has one)" "select sc_xlsx('$work/x.xlsx', 'select 1 as one', 'S', '{\"columns\": {\"nope\": \"currency\"}}')"
+check "~its object has no \"query\" text" "select sc_xlsx('$work/x.xlsx', '{\"A\": {\"freeze_panes\": \"B2\"}}'::json, '{}')"
+check "~sheet \"B\": format.header: true or false" "select sc_xlsx('$work/x.xlsx', '{\"A\": \"select 1\", \"B\": {\"query\": \"select 1\", \"header\": 1}}'::json, '{}')"
 # CSV: a query's rows with its columns' names first, read back as rows (no sheet), a delimiter
 # given or found.
 check "3" "select sc_csv('$work/one.csv', 'select n, n * 1.5 as half, n % 2 = 0 as even, date ''2026-10-30'' + n as day, ''row, '' || n as label, null::text as nothing, ''007'' as code from generate_series(1, 3) n')"
@@ -354,18 +391,18 @@ else
 fi
 
 if [ "$check_extension" = 1 ]; then
-    check "sc_pglib|1.10" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.11" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "" "set client_min_messages = warning; drop extension sc_pglib cascade"
     check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_mkdir', 'sc_xlsx_sheets', 'sc_csv', 'sc_read_csv', 'sc_csvzip', 'sc_read_csvzip'))"
     # Updating from 1.0, as an existing database does.
     check "" "create extension sc_pglib version '1.0'"
     check "f" "select exists (select 1 from pg_proc where proname = 'sc_redis_get')"
     check "" "alter extension sc_pglib update"
-    check "sc_pglib|1.10" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.11" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_redis')"
     check "t" "select exists (select 1 from pg_proc where proname = 'sc_redis_hgetall')"
     check "2" "select count(*) from pg_proc where proname = 'sc_redis_sadd'"
-    check "4" "select count(*) from pg_proc where proname = 'sc_xlsx'"
+    check "7" "select count(*) from pg_proc where proname = 'sc_xlsx'"
     check "3" "select count(*) from pg_proc where proname = 'sc_read_xlsx'"
     check "2" "select count(*) from pg_proc where proname = 'sc_read_xlsx' and pronargdefaults = 1"
     check "t" "select pg_get_function_result(oid) = 'SETOF record' from pg_proc where proname = 'sc_read_xlsx' and pronargs = 3 and proargtypes[1] = 'text'::regtype"
