@@ -1,5 +1,5 @@
 # sc_pglib: simply-cpp functions for PostgreSQL
 comment = 'simply-cpp functions (base64, Redis, Excel workbooks and CSV files written and read, folders)'
-default_version = '1.8'
+default_version = '1.9'
 module_pathname = '$libdir/sc_pglib'
 relocatable = true

@@ -60,7 +60,7 @@ if [ "$major" -ge 18 ]; then
     check_extension=1
 else
     echo "PostgreSQL $major: running the extension scripts directly (CREATE EXTENSION of an uninstalled extension needs 18)"
-    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql sc_pglib--1.7--1.8.sql; do
+    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql sc_pglib--1.7--1.8.sql sc_pglib--1.8--1.9.sql; do
         sed -e '/^\\echo/d' -e "s|MODULE_PATHNAME|$library|g" "$sql_dir/$step" | psql_run
     done
     check_extension=0
@@ -209,6 +209,17 @@ check "~the delimiter is one character" "select sc_csv('$work/x.csv', 'select 1'
 check "~the path must be absolute" "select sc_csv('relative.csv', 'select 1')"
 check "~sc_csv: its query returns no rows" "select sc_csv('$work/x.csv', 'create temp table sc_pglib_c (a int)')"
 check "~sc_read_csv: \"$work/missing.csv\"" "select * from sc_read_csv('$work/missing.csv') as x(a text)"
+# CSV in a ZIP archive: one entry (the archive's name with .csv, or as given), read back the same
+check "3" "select sc_csvzip('$work/one.zip', 'select n, n * 1000000 as big, ''row, '' || n as label from generate_series(1, 3) n')"
+unzip -l "$work/one.zip" | grep -q ' one.csv$' && echo "ok: one.zip holds one.csv" || { echo "FAILED: one.zip's entry"; failures=$((failures + 1)); }
+check '6|6000000|row, 1' "select sum(a), sum(b), min(c) from sc_read_csvzip('$work/one.zip', 'one.csv', 2) as x(a int, b bigint, c text)"
+check "2" "select sc_csvzip('$work/two.zip', 'select 1.5 as price union all select 2.25', 'prices.csv', ';')"
+check '3.75' "select sum(a) from sc_read_csvzip('$work/two.zip', 'prices.csv', 2) as x(a numeric)"
+check '3.75' "select sum(a) from sc_read_csvzip('$work/two.zip', 'prices.csv', 2, ';') as x(a numeric)"
+check "~there's no \"nope.csv\" in it (it has prices.csv)" "select * from sc_read_csvzip('$work/two.zip', 'nope.csv') as x(a text)"
+check "~sc_read_csvzip: \"$work/one.csv\"" "select * from sc_read_csvzip('$work/one.csv', 'one.csv') as x(a text)"
+check "~the path must be absolute" "select sc_csvzip('relative.zip', 'select 1')"
+check "~rows are numbered from 1" "select * from sc_read_csvzip('$work/one.zip', 'one.csv', 0) as x(a text)"
 check "" "create role sc_pglib_writer"
 # sc_mkdir: only under /var/www/data/output (its making is tested by test-folders), revoked from PUBLIC
 check "~isn't /var/www/data/output or a folder in it" "select sc_mkdir('$work/x')"
@@ -221,6 +232,8 @@ check "~permission denied to read a file" "set role sc_pglib_writer; select * fr
 check "~permission denied to write a file" "set role sc_pglib_writer; select sc_xlsx('$work/x.xlsx', 'select 1')"
 check "~permission denied to read a file" "set role sc_pglib_writer; select * from sc_read_csv('$work/one.csv') as x(a text)"
 check "~permission denied to write a file" "set role sc_pglib_writer; select sc_csv('$work/x.csv', 'select 1')"
+check "~permission denied to read a file" "set role sc_pglib_writer; select * from sc_read_csvzip('$work/one.zip', 'one.csv') as x(a text)"
+check "~permission denied to write a file" "set role sc_pglib_writer; select sc_csvzip('$work/x.zip', 'select 1')"
 check "f" "select '$( [ -e "$work/x.xlsx" ] && echo t || echo f)'"
 
 if [ -n "${SC_REDIS_DEMO_SERVER:-}" ]; then
@@ -328,14 +341,14 @@ else
 fi
 
 if [ "$check_extension" = 1 ]; then
-    check "sc_pglib|1.8" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.9" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "" "set client_min_messages = warning; drop extension sc_pglib cascade"
-    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_mkdir', 'sc_xlsx_sheets', 'sc_csv', 'sc_read_csv'))"
+    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_mkdir', 'sc_xlsx_sheets', 'sc_csv', 'sc_read_csv', 'sc_csvzip', 'sc_read_csvzip'))"
     # Updating from 1.0, as an existing database does.
     check "" "create extension sc_pglib version '1.0'"
     check "f" "select exists (select 1 from pg_proc where proname = 'sc_redis_get')"
     check "" "alter extension sc_pglib update"
-    check "sc_pglib|1.8" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.9" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_redis')"
     check "t" "select exists (select 1 from pg_proc where proname = 'sc_redis_hgetall')"
     check "2" "select count(*) from pg_proc where proname = 'sc_redis_sadd'"
@@ -344,6 +357,7 @@ if [ "$check_extension" = 1 ]; then
     check "2" "select count(*) from pg_proc where proname = 'sc_read_xlsx' and pronargdefaults = 1"
     check "t" "select pg_get_function_result(oid) = 'SETOF record' from pg_proc where proname = 'sc_read_xlsx' and pronargs = 3 and proargtypes[1] = 'text'::regtype"
     check "1" "select count(*) from pg_proc where proname = 'sc_xlsx_sheets'"
+    check "2" "select count(*) from pg_proc where proname in ('sc_csvzip', 'sc_read_csvzip')"
 fi
 
 if [ "$failures" -ne 0 ]; then
