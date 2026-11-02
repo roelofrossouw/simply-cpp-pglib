@@ -23,6 +23,8 @@ find_or_install_package(sc-core simply-cpp-dev simply-cpp 1.20.0)
 find_or_install_package(sc-redis simply-cpp-redis-dev simply-cpp-redis 1.3.0)
 find_or_install_package(sc-firebase simply-cpp-firebase-dev simply-cpp-firebase 1.0.0) # the Realtime Database
 find_or_install_package(sc-office simply-cpp-office-dev simply-cpp-office 1.11.0)
+# An insurer's capital and reserving calculations (sc_fsc_emv, sc_fsc_solve_risk_prem).
+find_or_install_package(sc-fsc simply-cpp-fsc-dev simply-cpp-fsc 1.0.0)
 
 ## PostgreSQL server ##
 # An extension is built for one PostgreSQL major version. Each Ubuntu release builds for a fixed
@@ -94,7 +96,7 @@ message(STATUS "Building for ${SC_PGLIB_PG_VERSION} (${SC_PGLIB_PG_CONFIG})")
 # A module PostgreSQL loads with dlopen(), so no "lib" prefix and no link against the server:
 # its symbols resolve at load time. macOS needs that said explicitly, and PostgreSQL 16 and
 # later look for ".dylib" there.
-add_library(sc_pglib MODULE src/sc_pglib.cpp src/sc_redis.cpp src/sc_firebase.cpp src/firebase_rows.cpp src/sc_xlsx.cpp src/xlsx_format.cpp src/sc_files.cpp src/folders.cpp)
+add_library(sc_pglib MODULE src/sc_pglib.cpp src/sc_redis.cpp src/sc_firebase.cpp src/firebase_rows.cpp src/sc_xlsx.cpp src/xlsx_format.cpp src/sc_files.cpp src/folders.cpp src/sc_fsc.cpp)
 target_include_directories(sc_pglib PRIVATE "${SC_PGLIB_PG_INCLUDEDIR}")
 # sc::sc-redis brings sc::sc-core (base64) with it.
 target_link_libraries(sc_pglib PRIVATE sc::sc-redis)
@@ -103,6 +105,8 @@ target_link_libraries(sc_pglib PRIVATE sc::sc-firebase-shared)
 # sc-office's shared library (its zip and XML underneath come with it), as sc-phplib links it.
 target_link_libraries(sc_pglib PRIVATE $<TARGET_LINKER_FILE:sc::sc-office-shared>)
 target_include_directories(sc_pglib PRIVATE $<TARGET_PROPERTY:sc::sc-office-shared,INTERFACE_INCLUDE_DIRECTORIES>)
+target_link_libraries(sc_pglib PRIVATE $<TARGET_LINKER_FILE:sc::sc-fsc-shared>)
+target_include_directories(sc_pglib PRIVATE $<TARGET_PROPERTY:sc::sc-fsc-shared,INTERFACE_INCLUDE_DIRECTORIES>)
 set_target_properties(sc_pglib PROPERTIES PREFIX "")
 if (APPLE)
     target_link_options(sc_pglib PRIVATE -undefined dynamic_lookup)
@@ -111,7 +115,7 @@ if (APPLE)
     endif ()
 endif ()
 
-set(SC_PGLIB_EXTENSION_FILES sql/sc_pglib.control sql/sc_pglib--1.0.sql sql/sc_pglib--1.0--1.1.sql sql/sc_pglib--1.1--1.2.sql sql/sc_pglib--1.2--1.3.sql sql/sc_pglib--1.3--1.4.sql sql/sc_pglib--1.4--1.5.sql sql/sc_pglib--1.5--1.6.sql sql/sc_pglib--1.6--1.7.sql sql/sc_pglib--1.7--1.8.sql sql/sc_pglib--1.8--1.9.sql sql/sc_pglib--1.9--1.10.sql sql/sc_pglib--1.10--1.11.sql sql/sc_pglib--1.11--1.12.sql sql/sc_pglib--1.12--1.13.sql sql/sc_pglib--1.13--1.14.sql)
+set(SC_PGLIB_EXTENSION_FILES sql/sc_pglib.control sql/sc_pglib--1.0.sql sql/sc_pglib--1.0--1.1.sql sql/sc_pglib--1.1--1.2.sql sql/sc_pglib--1.2--1.3.sql sql/sc_pglib--1.3--1.4.sql sql/sc_pglib--1.4--1.5.sql sql/sc_pglib--1.5--1.6.sql sql/sc_pglib--1.6--1.7.sql sql/sc_pglib--1.7--1.8.sql sql/sc_pglib--1.8--1.9.sql sql/sc_pglib--1.9--1.10.sql sql/sc_pglib--1.10--1.11.sql sql/sc_pglib--1.11--1.12.sql sql/sc_pglib--1.12--1.13.sql sql/sc_pglib--1.13--1.14.sql sql/sc_pglib--1.14--1.15.sql)
 if (SC_PGLIB_INSTALL)
     install(TARGETS sc_pglib LIBRARY DESTINATION "${SC_PGLIB_PG_PKGLIBDIR}" COMPONENT runtime)
     install(FILES ${SC_PGLIB_EXTENSION_FILES} DESTINATION "${SC_PGLIB_PG_SHAREDIR}/extension" COMPONENT runtime)
@@ -144,4 +148,4 @@ endif ()
 #############
 # Packaging #
 #############
-package_sc_module(DEPENDS "postgresql-${SC_PGLIB_PG_MAJOR}" "simply-cpp-office (>= 1.11.0~)" "simply-cpp-firebase (>= 1.0.0~)")
+package_sc_module(DEPENDS "postgresql-${SC_PGLIB_PG_MAJOR}" "simply-cpp-office (>= 1.11.0~)" "simply-cpp-firebase (>= 1.0.0~)" "simply-cpp-fsc (>= 1.0.0~)")

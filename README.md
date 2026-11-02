@@ -329,6 +329,30 @@ SELECT path FROM sc_list_files('/var/www/data/output/queue/123', '1 minute', 100
 'log/<name>'`): `true`, or `false` when it isn't there. Only a plain file name, never the file the
 server writes to now (`current_logfiles`). Since 1.12; `EXECUTE` is revoked from `PUBLIC`.
 
+## Capital and reserving (sc-fsc)
+
+Expected cash flows valued at a risk premium, and the risk premium solved from a market value, by
+[sc-fsc](https://github.com/roelofrossouw/simply-cpp-fsc): Newton-Raphson with the derivative exact. The
+arguments are those of the goalseek extension's `emv_cpp` and `solve_risk_prem`, so a query only changes
+the function's name.
+
+```sql
+-- Coupons of 30 in 91, 182, 273 and 365 days and 1030 in 730, at their spot rates
+SELECT sc_fsc_emv(0.0123, 35, array[91, 182, 273, 365, 730], array[30, 30, 30, 30, 1030]::float8[],
+                  array[0.075, 0.077, 0.079, 0.08, 0.083]::float8[]);                   -- the value at 1.23% + 35bp
+
+SELECT sc_fsc_solve_risk_prem(1000, 35, array[91, 182, 273, 365, 730], array[30, 30, 30, 30, 1030]::float8[],
+                              array[0.075, 0.077, 0.079, 0.08, 0.083]::float8[]);       -- the premium for 1000
+```
+
+| Function | Returns | Notes |
+|---|---|---|
+| `sc_fsc_emv(risk_prem float8, spread float8, durations int[], coupon_values float8[], spot_rates float8[])` | `float8` | the sum of each coupon times `(1 + (spot + risk_prem + spread) / 365.25) ^ -days`: rates as fractions a year, the spread in basis points |
+| `sc_fsc_solve_risk_prem(market_value float8, spread float8, durations int[], coupon_values float8[], spot_rates float8[], max_iterations int = 1000, tolerance float8 = 1e-8)` | `float8` | the premium at which `sc_fsc_emv` is `market_value`, from 0; an error when it isn't within `tolerance` after `max_iterations` steps, or the value stops changing with the premium |
+
+The arrays must be one-dimensional, the same length and without NULLs: an error names the one that
+isn't. Both are `IMMUTABLE` and `PARALLEL SAFE`.
+
 ## Redis
 
 `sc_pglib` talks to Redis (standalone or Cluster) through `sc::redis`, mainly
@@ -516,7 +540,7 @@ writes aren't undone when the transaction rolls back.
 
 - The module (`sc_pglib.so`, or `sc_pglib.dylib` on macOS) is a PostgreSQL
   loadable module using the version-1 calling convention: `src/sc_pglib.cpp`
-  (base64), `src/sc_redis.cpp` (Redis), `src/sc_xlsx.cpp` (Excel workbooks and CSV files), `src/xlsx_format.cpp` (a sheet's formatting) and `src/sc_files.cpp` with `src/folders.cpp` (files, folders and the server's logs),
+  (base64), `src/sc_redis.cpp` (Redis), `src/sc_xlsx.cpp` (Excel workbooks and CSV files), `src/xlsx_format.cpp` (a sheet's formatting) and `src/sc_files.cpp` with `src/folders.cpp` (files, folders and the server's logs), `src/sc_fsc.cpp` (capital and reserving, by sc-fsc's shared library),
   linking `sc::sc-redis` and `sc::sc-core` statically, and hiredis and
   sc-office's shared library dynamically. `src/pg_glue.h` has the rules
   for mixing C++ and PostgreSQL: C++ exceptions never reach PostgreSQL, and
@@ -524,11 +548,11 @@ writes aren't undone when the transaction rolls back.
   because `ereport()` `longjmp()`s past destructors.
 - `sql/sc_pglib.control` and the `sql/sc_pglib--*.sql` scripts are what `CREATE
   EXTENSION` reads: `sc_pglib--1.0.sql` (base64) and the updates `1.0--1.1`
-  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`), `1.4--1.5` (`sc_read_xlsx`), `1.5--1.6` (sheets as rows, `sc_xlsx_sheets`) `1.6--1.7` (`sc_csv`, `sc_read_csv`), `1.7--1.8` (`sc_mkdir`), `1.8--1.9` (`sc_csvzip`, `sc_read_csvzip`), `1.9--1.10` (`sc_csvzip` with several files), `1.10--1.11` (`sc_xlsx` with formatting) and `1.11--1.12` (CSV gzipped, in an encoding and added to an archive; `sc_move`, `sc_list_files`, `sc_remove_log`). They and the module install into the server's own directories
+  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`), `1.4--1.5` (`sc_read_xlsx`), `1.5--1.6` (sheets as rows, `sc_xlsx_sheets`) `1.6--1.7` (`sc_csv`, `sc_read_csv`), `1.7--1.8` (`sc_mkdir`), `1.8--1.9` (`sc_csvzip`, `sc_read_csvzip`), `1.9--1.10` (`sc_csvzip` with several files), `1.10--1.11` (`sc_xlsx` with formatting) `1.11--1.12` (CSV gzipped, in an encoding and added to an archive; `sc_move`, `sc_list_files`, `sc_remove_log`), `1.12--1.13` (Firebase), `1.13--1.14` (Firebase foreign tables) and `1.14--1.15` (`sc_fsc_emv`, `sc_fsc_solve_risk_prem`). They and the module install into the server's own directories
   (`pg_config --sharedir`/extension and `--pkglibdir`).
-- The extension version (`1.12`) is separate from the package version. A package
+- The extension version (`1.15`) is separate from the package version. A package
   update replaces the module in place; adding or changing SQL objects needs a new
-  extension version with an update script (`sc_pglib--1.12--1.13.sql`), after which
+  extension version with an update script (`sc_pglib--1.15--1.16.sql`), after which
   databases run `ALTER EXTENSION sc_pglib UPDATE`.
 
 ## Building

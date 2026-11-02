@@ -60,7 +60,7 @@ if [ "$major" -ge 18 ]; then
     check_extension=1
 else
     echo "PostgreSQL $major: running the extension scripts directly (CREATE EXTENSION of an uninstalled extension needs 18)"
-    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql sc_pglib--1.7--1.8.sql sc_pglib--1.8--1.9.sql sc_pglib--1.9--1.10.sql sc_pglib--1.10--1.11.sql sc_pglib--1.11--1.12.sql sc_pglib--1.12--1.13.sql sc_pglib--1.13--1.14.sql; do
+    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql sc_pglib--1.7--1.8.sql sc_pglib--1.8--1.9.sql sc_pglib--1.9--1.10.sql sc_pglib--1.10--1.11.sql sc_pglib--1.11--1.12.sql sc_pglib--1.12--1.13.sql sc_pglib--1.13--1.14.sql sc_pglib--1.14--1.15.sql; do
         sed -e '/^\\echo/d' -e "s|MODULE_PATHNAME|$library|g" "$sql_dir/$step" | psql_run
     done
     check_extension=0
@@ -477,16 +477,30 @@ else
     echo "skipped: Firebase key checks (no openssl)"
 fi
 
+# An insurer's calculations (sc-fsc): the value at a premium, and the premium back from a value
+fsc_flows="array[91, 182, 273, 365, 730], array[30, 30, 30, 30, 1030]::float8[], array[0.075, 0.077, 0.079, 0.08, 0.083]::float8[]"
+check '909.443293474' "select round(sc_fsc_emv(0.01, 50, array[365], array[1000.0]::float8[], array[0.08]::float8[])::numeric, 9)"
+check '0' "select sc_fsc_emv(0.01, 50, '{}'::int[], '{}'::float8[], '{}'::float8[])"
+check '0.012300000' "select round(sc_fsc_solve_risk_prem(sc_fsc_emv(0.0123, 35, $fsc_flows), 35, $fsc_flows)::numeric, 9)"
+check '0.050000000' "select round(sc_fsc_solve_risk_prem(sc_fsc_emv(0.05, 0, $fsc_flows), 0, $fsc_flows, 50, 1e-10)::numeric, 9)"
+check "~must be the same length, not 2, 1 and 2" "select sc_fsc_emv(0.01, 0, array[1, 2], array[1.0]::float8[], array[0.1, 0.1]::float8[])"
+check "~coupon_values[2] is NULL" "select sc_fsc_emv(0.01, 0, array[1, 2], array[1.0, null]::float8[], array[0.1, 0.1]::float8[])"
+check "~durations must be a one-dimensional array" "select sc_fsc_emv(0.01, 0, array[[1, 2]], array[1.0]::float8[], array[0.1]::float8[])"
+check "~after 1 iterations" "select sc_fsc_solve_risk_prem(500, 0, array[365], array[1000.0]::float8[], array[0.08]::float8[], 1)"
+check "~sc_fsc_solve_risk_prem: " "select sc_fsc_solve_risk_prem(-10, 0, array[365], array[1000.0]::float8[], array[0.08]::float8[])"
+check "~the tolerance must be a number more than 0" "select sc_fsc_solve_risk_prem(900, 0, array[365], array[1000.0]::float8[], array[0.08]::float8[], 10, 0)"
+check "" "select sc_fsc_emv(null, 0, array[365], array[1000.0]::float8[], array[0.08]::float8[])"
+
 if [ "$check_extension" = 1 ]; then
-    check "sc_pglib|1.14" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.15" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "" "set client_min_messages = warning; drop extension sc_pglib cascade"
-    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname like 'sc_firebase%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_mkdir', 'sc_xlsx_sheets', 'sc_csv', 'sc_read_csv', 'sc_csvzip', 'sc_read_csvzip', 'sc_move', 'sc_list_files', 'sc_remove_log'))"
+    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname like 'sc_firebase%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_mkdir', 'sc_xlsx_sheets', 'sc_csv', 'sc_read_csv', 'sc_csvzip', 'sc_read_csvzip', 'sc_move', 'sc_list_files', 'sc_remove_log', 'sc_fsc_emv', 'sc_fsc_solve_risk_prem'))"
     # Updating from 1.0, as an existing database does.
     check "" "create extension sc_pglib version '1.0'"
     check "f" "select exists (select 1 from pg_proc where proname = 'sc_redis_get')"
     # 1.14 gives sc_firebase a handler, which PostgreSQL warns about (no foreign tables exist yet).
     check "~changing the foreign-data wrapper handler" "alter extension sc_pglib update"
-    check "sc_pglib|1.14" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.15" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_redis')"
     check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_firebase')"
     check "7" "select count(*) from pg_proc where proname like 'sc_firebase_%' and proname not in ('sc_firebase_validator', 'sc_firebase_fdw_handler')"
@@ -498,6 +512,7 @@ if [ "$check_extension" = 1 ]; then
     check "t" "select pg_get_function_result(oid) = 'SETOF record' from pg_proc where proname = 'sc_read_xlsx' and pronargs = 3 and proargtypes[1] = 'text'::regtype"
     check "1" "select count(*) from pg_proc where proname = 'sc_xlsx_sheets'"
     check "4" "select count(*) from pg_proc where proname in ('sc_csvzip', 'sc_read_csvzip')"
+    check "2" "select count(*) from pg_proc where proname in ('sc_fsc_emv', 'sc_fsc_solve_risk_prem')"
 fi
 
 if [ "$failures" -ne 0 ]; then
