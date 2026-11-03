@@ -353,6 +353,82 @@ SELECT sc_fsc_solve_risk_prem(1000, 35, array[91, 182, 273, 365, 730], array[30,
 The arrays must be one-dimensional, the same length and without NULLs: an error names the one that
 isn't. Both are `IMMUTABLE` and `PARALLEL SAFE`.
 
+## Calling 1web (sc_oneweb)
+
+The database asks the 1web site to run one of its functions by name and gets back the answer's data.
+It isn't general HTTP: the only request is "run `name` with these params" on the one site the
+settings name for this database (since 1.14.0, extension 1.16; it replaces libpgru's `fetch_curl`).
+
+```sql
+SELECT sc_oneweb('ping');                                         -- 1web's data, as jsonb
+SELECT sc_oneweb('id_lookup', '{"id_number": "...", "calling_user": 42}', 60000);
+SELECT sc_oneweb_config();                                        -- the settings in force, without the key
+```
+
+| Function | Returns | Notes |
+|---|---|---|
+| `sc_oneweb(name text, params jsonb = '{}', timeout_ms integer = NULL)` | `jsonb` | 1web's `data` (JSON `null` is SQL `NULL`); `name` must match `^[a-z][a-z0-9_]{0,63}$`; NULL `params` is `{}`; `timeout_ms` (1000 to 600000) is this call's limit instead of the file's |
+| `sc_oneweb_config()` | `jsonb` | `database`, `config_file`, `section`, `url`, `key_from` (`key_file` or `key`), `key_file`, `key_bytes`, the limits, `ca_file`, `on_error` |
+
+Both are `VOLATILE` and `PARALLEL UNSAFE`. EXECUTE is revoked from PUBLIC: only the owner (a superuser)
+runs them, and 1web grants `SECURITY DEFINER` wrappers of its own.
+
+**Settings** come from a file on the database server, never from the database (which may be a copy
+restored from production). The file is `/etc/sc-pglib/oneweb.ini` (owner root, group postgres, mode
+0640), or another named by `sc_pglib.oneweb_config` (superusers only). It's read again whenever it
+changes.
+
+```ini
+[default]                 ; for a database without its own section
+url = https://example.com/interface/index.php/
+key_file = /etc/sc-pglib/oneweb.key    ; or key = <secret>; at least 32 bytes
+timeout_ms = 30000
+connect_timeout_ms = 5000
+max_response_bytes = 10485760
+ca_file =                 ; a CA bundle used instead of the system's
+on_error = error          ; or warning: a WARNING and NULL instead of an ERROR
+
+[database whd_12345]      ; a branch database calls its own branch site; the rest from [default]
+url = https://whd-12345.example.com/interface/index.php/
+```
+
+The section is `[database <current_database()>]`, else `[default]`. Without the file, a section that
+applies, a `url` or a key, a call is an ERROR saying sc_oneweb isn't set up for the database: there's no
+built-in URL. `url` must be `https://` and end with `/`. A key file's surrounding white space (its line
+end) isn't part of the key. Comments start a line, or follow a space at a line's end, so a `key =` can't
+hold " ;" or " #". Unknown settings and sections are errors.
+
+**The request** is `POST <url><name>` with `params` as compact JSON (`Content-Type: application/json`,
+`User-Agent: sc-pglib/<version>`) and these headers:
+
+| Header | |
+|---|---|
+| `X-OneWeb-Database` | `current_database()` |
+| `X-OneWeb-Role`, `X-OneWeb-Session-Role` | `current_user` (in a SECURITY DEFINER wrapper, its owner) and `session_user` |
+| `X-OneWeb-Timestamp` | Unix seconds |
+| `X-OneWeb-Nonce` | 16 random bytes, 32 hex digits |
+| `X-OneWeb-Signature` | hex HMAC-SHA256 with the key over `name \n timestamp \n nonce \n database \n body`, the body exactly as sent |
+
+A test vector for the other side: key `0123456789abcdef0123456789abcdef`, name `ping`, timestamp
+`1700000000`, nonce `00112233445566778899aabbccddeeff`, database `1web`, body `{"hello":"world"}` sign
+as `47000de7c86714a083c28418a3a8836059e07399f871fafdc5954c38ba3fdcda` (PHP:
+`hash_hmac('sha256', "ping\n1700000000\n00112233445566778899aabbccddeeff\n1web\n{\"hello\":\"world\"}", $key)`).
+
+TLS always checks the server's certificate and name (`ca_file` only changes which CAs are trusted);
+redirects aren't followed and no proxy is used, whatever the environment says.
+
+**The answer**: HTTP 200 with `{"ok": true, "data": ...}` gives `data` (numbers keep every digit).
+`{"ok": false, "error": "..."}` is an ERROR with that message, naming the call:
+`sc_oneweb(id_lookup): no such person`. Anything else (another status, not JSON, no `ok`, larger than
+`max_response_bytes`, a timeout, a failed connection or certificate) is an ERROR naming the call, the
+HTTP status and at most 200 characters of the body. With `on_error = warning` it's a WARNING and NULL
+instead (a missing or wrong settings file is always an ERROR). Every call has its own answer: a failure
+never returns an earlier call's data.
+
+A cancel (`pg_cancel_backend`, `statement_timeout`) or a terminate stops the transfer at once. Params,
+bodies and the key never go into the server's log; at `DEBUG1` it says the name, the HTTP status and
+the milliseconds.
+
 ## Redis
 
 `sc_pglib` talks to Redis (standalone or Cluster) through `sc::redis`, mainly
@@ -548,11 +624,11 @@ writes aren't undone when the transaction rolls back.
   because `ereport()` `longjmp()`s past destructors.
 - `sql/sc_pglib.control` and the `sql/sc_pglib--*.sql` scripts are what `CREATE
   EXTENSION` reads: `sc_pglib--1.0.sql` (base64) and the updates `1.0--1.1`
-  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`), `1.4--1.5` (`sc_read_xlsx`), `1.5--1.6` (sheets as rows, `sc_xlsx_sheets`) `1.6--1.7` (`sc_csv`, `sc_read_csv`), `1.7--1.8` (`sc_mkdir`), `1.8--1.9` (`sc_csvzip`, `sc_read_csvzip`), `1.9--1.10` (`sc_csvzip` with several files), `1.10--1.11` (`sc_xlsx` with formatting) `1.11--1.12` (CSV gzipped, in an encoding and added to an archive; `sc_move`, `sc_list_files`, `sc_remove_log`), `1.12--1.13` (Firebase), `1.13--1.14` (Firebase foreign tables) and `1.14--1.15` (`sc_fsc_emv`, `sc_fsc_solve_risk_prem`). They and the module install into the server's own directories
+  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`), `1.4--1.5` (`sc_read_xlsx`), `1.5--1.6` (sheets as rows, `sc_xlsx_sheets`) `1.6--1.7` (`sc_csv`, `sc_read_csv`), `1.7--1.8` (`sc_mkdir`), `1.8--1.9` (`sc_csvzip`, `sc_read_csvzip`), `1.9--1.10` (`sc_csvzip` with several files), `1.10--1.11` (`sc_xlsx` with formatting) `1.11--1.12` (CSV gzipped, in an encoding and added to an archive; `sc_move`, `sc_list_files`, `sc_remove_log`), `1.12--1.13` (Firebase), `1.13--1.14` (Firebase foreign tables) `1.14--1.15` (`sc_fsc_emv`, `sc_fsc_solve_risk_prem`) and `1.15--1.16` (`sc_oneweb`, `sc_oneweb_config`). They and the module install into the server's own directories
   (`pg_config --sharedir`/extension and `--pkglibdir`).
-- The extension version (`1.15`) is separate from the package version. A package
+- The extension version (`1.16`) is separate from the package version. A package
   update replaces the module in place; adding or changing SQL objects needs a new
-  extension version with an update script (`sc_pglib--1.15--1.16.sql`), after which
+  extension version with an update script (`sc_pglib--1.16--1.17.sql`), after which
   databases run `ALTER EXTENSION sc_pglib UPDATE`.
 
 ## Building

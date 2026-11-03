@@ -60,7 +60,7 @@ if [ "$major" -ge 18 ]; then
     check_extension=1
 else
     echo "PostgreSQL $major: running the extension scripts directly (CREATE EXTENSION of an uninstalled extension needs 18)"
-    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql sc_pglib--1.7--1.8.sql sc_pglib--1.8--1.9.sql sc_pglib--1.9--1.10.sql sc_pglib--1.10--1.11.sql sc_pglib--1.11--1.12.sql sc_pglib--1.12--1.13.sql sc_pglib--1.13--1.14.sql sc_pglib--1.14--1.15.sql; do
+    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql sc_pglib--1.7--1.8.sql sc_pglib--1.8--1.9.sql sc_pglib--1.9--1.10.sql sc_pglib--1.10--1.11.sql sc_pglib--1.11--1.12.sql sc_pglib--1.12--1.13.sql sc_pglib--1.13--1.14.sql sc_pglib--1.14--1.15.sql sc_pglib--1.15--1.16.sql; do
         sed -e '/^\\echo/d' -e "s|MODULE_PATHNAME|$library|g" "$sql_dir/$step" | psql_run
     done
     check_extension=0
@@ -491,16 +491,96 @@ check "~sc_fsc_solve_risk_prem: " "select sc_fsc_solve_risk_prem(-10, 0, array[3
 check "~the tolerance must be a number more than 0" "select sc_fsc_solve_risk_prem(900, 0, array[365], array[1000.0]::float8[], array[0.08]::float8[], 10, 0)"
 check "" "select sc_fsc_emv(null, 0, array[365], array[1000.0]::float8[], array[0.08]::float8[])"
 
+# sc_oneweb: 1web called by name, against a stand-in (tests/oneweb_server.py, HTTPS with its own
+# certificate as the ca_file) that checks each signature.
+if command -v openssl >/dev/null && command -v python3 >/dev/null; then
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -pkeyopt ec_param_enc:named_curve -nodes -days 1 \
+        -subj /CN=sc-pglib-oneweb -addext basicConstraints=critical,CA:TRUE -addext subjectAltName=IP:127.0.0.1 \
+        -keyout "$work/oneweb.crt.key" -out "$work/oneweb.crt" >/dev/null 2>&1
+    printf '0123456789abcdef0123456789abcdef\n' >"$work/oneweb.key"
+    mkfifo "$work/oneweb.port"
+    python3 "$(dirname "$0")/oneweb_server.py" "$work/oneweb.crt" "$work/oneweb.crt.key" "$work/oneweb.key" >"$work/oneweb.port" 2>"$work/oneweb_server.log" &
+    oneweb_server=$!
+    read -r _ oneweb_port <"$work/oneweb.port"
+    trap 'kill $oneweb_server 2>/dev/null || true; cleanup' EXIT
+    base="https://127.0.0.1:$oneweb_port"
+    ini="$work/oneweb.ini"
+    psql_run -c "alter role postgres set sc_pglib.oneweb_config = '$ini'"
+
+    check "~sc_oneweb is not set up for database \"postgres\": there's no $ini" "select sc_oneweb('ping')"
+    printf '[database other]\nurl = %s/main/\nkey_file = %s\n' "$base" "$work/oneweb.key" >"$ini"
+    check "~not set up for database \"postgres\": no [database postgres] or [default] section" "select sc_oneweb('ping')"
+    printf '[default]\nurl = http://127.0.0.1:%s/main/\nkey_file = %s\n' "$oneweb_port" "$work/oneweb.key" >"$ini"
+    check "~url must be https://" "select sc_oneweb('ping')"
+    cat >"$ini" <<INI
+; the stand-in's main site for every database
+[default]
+url = $base/main/
+key_file = $work/oneweb.key
+ca_file = $work/oneweb.crt
+timeout_ms = 3000
+max_response_bytes = 1000
+INI
+    check "main" "select sc_oneweb('ping')->>'site'"
+    check '{"a":1,"b":"x, y: z","c":[1,2]}|postgres|postgres|postgres|application/json|t' \
+        "select d->>'body', d->>'database', d->>'role', d->>'session_role', d->>'type', d->>'agent' like 'sc-pglib/%' from sc_oneweb('ping', '{\"a\": 1, \"b\": \"x, y: z\", \"c\": [1, 2]}') d"
+    check "{}" "select sc_oneweb('ping', null)->>'body'"
+    check "~sc_oneweb(refuse): no such person" "select sc_oneweb('refuse')"
+    check "~sc_oneweb(broken): HTTP 500: Internal trouble" "select sc_oneweb('broken')"
+    check "~sc_oneweb(html): HTTP 200: <html><body>not json" "select sc_oneweb('html')"
+    check "~sc_oneweb(big): HTTP 200: the answer is larger than max_response_bytes (1000)" "select sc_oneweb('big')"
+    check "~sc_oneweb(slow): no answer within 1000 ms" "select sc_oneweb('slow', '{}', 1000)"
+    check "~sc_oneweb(moved): HTTP 302" "select sc_oneweb('moved')"
+    check "t" "select sc_oneweb('nothing') is null"
+    check "12345678901234567890.123456789" "select sc_oneweb('number')"
+    check "~isn't a 1web function name" "select sc_oneweb('Bad/Name')"
+    check "~the name can't be NULL" "select sc_oneweb(null)"
+    check "~timeout_ms must be 1000 to 600000, not 999" "select sc_oneweb('ping', '{}', 999)"
+    started=$(date +%s)
+    check "~canceling statement due to statement timeout" "set statement_timeout = 500; select sc_oneweb('slow')"
+    expect "a cancel stops the transfer at once" "t" "$([ $(($(date +%s) - started)) -lt 3 ] && echo t || echo f)"
+    expect "a failure, then the next call's own answer" "~main" "$(session -v ON_ERROR_STOP=0 <<<"select sc_oneweb('broken'); select sc_oneweb('ping')->>'site'")"
+    expect "DEBUG1: the name, status and time, not the params" "~sc_oneweb(ping): HTTP 200 in" \
+        "$(session <<<"set client_min_messages = debug1; select sc_oneweb('ping', '{\"secret\": \"param-123\"}') is not null")"
+    if grep -q 'param-123' "$work/server.log"; then echo "FAILED: the params are in the server log"; failures=$((failures + 1)); else echo "ok: the params aren't in the server log"; fi
+    check "default|$base/main/|key_file|32|3000|f" \
+        "select c->>'section', c->>'url', c->>'key_from', c->>'key_bytes', c->>'timeout_ms', c::text like '%0123456789abcdef%' from sc_oneweb_config() c"
+    psql_run -c "create role sc_oneweb_tester"
+    check "~permission denied for function sc_oneweb" "set role sc_oneweb_tester; select sc_oneweb('ping')"
+    check "~permission denied for function sc_oneweb_config" "set role sc_oneweb_tester; select sc_oneweb_config()"
+
+    # The database's own section (the file read again once it changes), with on_error = warning.
+    cat >>"$ini" <<INI
+
+[database postgres]
+url = $base/branch/
+on_error = warning
+INI
+    check "branch" "select sc_oneweb('ping')->>'site'"
+    expect "on_error = warning: a WARNING and NULL" "~WARNING:  sc_oneweb(broken): HTTP 500: Internal trouble" "$(session <<<"select sc_oneweb('broken') is null")"
+    expect "on_error = warning: NULL" "~t" "$(session <<<"select sc_oneweb('broken') is null")"
+    # Another key: the stand-in refuses the signature.
+    printf '%s\n' "a-different-key-that-is-long-enough-to-use" >"$work/other.key"
+    sed -i.bak "s|key_file = $work/oneweb.key|key_file = $work/other.key|" "$ini"
+    expect "another key: the signature refused" "~WARNING:  sc_oneweb(ping): HTTP 403: Wrong signature" "$(session <<<"select sc_oneweb('ping') is null")"
+    check "42" "select sc_oneweb_config()->>'key_bytes'"
+    kill "$oneweb_server" 2>/dev/null || true
+    wait "$oneweb_server" 2>/dev/null || true
+    check "~WARNING:  sc_oneweb(ping): Couldn't connect" "select sc_oneweb('ping')"
+else
+    echo "skipped: sc_oneweb (no openssl or python3)"
+fi
+
 if [ "$check_extension" = 1 ]; then
-    check "sc_pglib|1.15" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.16" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "" "set client_min_messages = warning; drop extension sc_pglib cascade"
-    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname like 'sc_firebase%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_mkdir', 'sc_xlsx_sheets', 'sc_csv', 'sc_read_csv', 'sc_csvzip', 'sc_read_csvzip', 'sc_move', 'sc_list_files', 'sc_remove_log', 'sc_fsc_emv', 'sc_fsc_solve_risk_prem'))"
+    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname like 'sc_firebase%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_mkdir', 'sc_xlsx_sheets', 'sc_csv', 'sc_read_csv', 'sc_csvzip', 'sc_read_csvzip', 'sc_move', 'sc_list_files', 'sc_remove_log', 'sc_fsc_emv', 'sc_fsc_solve_risk_prem', 'sc_oneweb', 'sc_oneweb_config'))"
     # Updating from 1.0, as an existing database does.
     check "" "create extension sc_pglib version '1.0'"
     check "f" "select exists (select 1 from pg_proc where proname = 'sc_redis_get')"
     # 1.14 gives sc_firebase a handler, which PostgreSQL warns about (no foreign tables exist yet).
     check "~changing the foreign-data wrapper handler" "alter extension sc_pglib update"
-    check "sc_pglib|1.15" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.16" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_redis')"
     check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_firebase')"
     check "7" "select count(*) from pg_proc where proname like 'sc_firebase_%' and proname not in ('sc_firebase_validator', 'sc_firebase_fdw_handler')"
@@ -513,6 +593,7 @@ if [ "$check_extension" = 1 ]; then
     check "1" "select count(*) from pg_proc where proname = 'sc_xlsx_sheets'"
     check "4" "select count(*) from pg_proc where proname in ('sc_csvzip', 'sc_read_csvzip')"
     check "2" "select count(*) from pg_proc where proname in ('sc_fsc_emv', 'sc_fsc_solve_risk_prem')"
+    check "2" "select count(*) from pg_proc where proname in ('sc_oneweb', 'sc_oneweb_config')"
 fi
 
 if [ "$failures" -ne 0 ]; then

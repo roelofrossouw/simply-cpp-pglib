@@ -1,4 +1,4 @@
-// The sc_pglib module: its PostgreSQL magic block and the base64 functions. The rules for
+// The sc_pglib module: its PostgreSQL magic block, its settings and the base64 functions. The rules for
 // mixing C++ and PostgreSQL are in pg_glue.h; the Redis functions are in sc_redis.cpp.
 
 #include <base64.h>
@@ -14,6 +14,17 @@ PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(sc_base64_encode);
 PG_FUNCTION_INFO_V1(sc_base64_decode);
+
+void _PG_init(void);
+}
+
+namespace sc_pglib {
+    void define_oneweb_settings(); // sc_oneweb.cpp
+}
+
+// The module's settings, when it's loaded: sc_pglib.oneweb_config.
+extern "C" void _PG_init(void) {
+    sc_pglib::define_oneweb_settings();
 }
 
 namespace {
