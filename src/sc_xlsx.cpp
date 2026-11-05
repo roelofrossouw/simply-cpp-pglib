@@ -64,6 +64,12 @@
 //                                      a CSV file per query in the archive, as sc_xlsx's sheets
 //   sc_read_csvzip(path, entry [, from_row [, delimiter]])
 //                                      that entry read as sc_read_csv reads a file
+//
+//   sc_csvgz(path, query [, delimiter])
+//                                      sc_csv's file gzipped, whatever path is called
+//   sc_read_csvgz(path [, from_row [, delimiter]])
+//                                      a gzipped CSV file read as sc_read_csv reads a file; an error
+//                                      when it isn't gzipped
 
 #include <excel.h>
 #include <codec.h>
@@ -118,6 +124,8 @@ PG_FUNCTION_INFO_V1(sc_read_csv_rows);
 PG_FUNCTION_INFO_V1(sc_csvzip_query);
 PG_FUNCTION_INFO_V1(sc_csvzip_files);
 PG_FUNCTION_INFO_V1(sc_read_csvzip_rows);
+PG_FUNCTION_INFO_V1(sc_csvgz_query);
+PG_FUNCTION_INFO_V1(sc_read_csvgz_rows);
 }
 
 namespace {
@@ -675,9 +683,12 @@ namespace {
         }
     }
 
-    // A CSV file's bytes (an entry of a ZIP archive when entry isn't null), gunzipped when they're
-    // compressed (gzip, bzip2, xz or zstd, whatever the name says), into out (allocated in the
-    // current context). Never raises.
+    // How a CSV file to read is packed: as it is (uncompressed when it's compressed: gzip, bzip2, xz or
+    // zstd, whatever the name says), gzipped (anything else an error), or an entry of a ZIP archive.
+    enum class packing : char { plain, gzip, zip };
+
+    // A CSV file's bytes, unpacked as packed says (entry: the ZIP archive's), into out (allocated in
+    // the current context). Never raises.
     struct raw_bytes {
         char *data = nullptr;
         std::size_t size = 0;
@@ -714,10 +725,11 @@ namespace {
         throw std::invalid_argument("more than one entry is " + what + has);
     }
 
-    void read_csv_bytes(const char *function, const char *path, const char *entry, raw_bytes &out, sc_pglib::pending_error &error) noexcept {
+    void read_csv_bytes(const char *function, const char *path, const packing packed, const char *entry, raw_bytes &out,
+                        sc_pglib::pending_error &error) noexcept {
         try {
             std::string bytes;
-            if (entry) {
+            if (packed == packing::zip) {
                 const auto archive = sc::archive::open(path);
                 bytes = archive.read(entry_named(archive, entry));
             } else {
@@ -726,7 +738,9 @@ namespace {
                 bytes.assign(std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{});
                 if (file.bad()) throw std::runtime_error("couldn't be read");
             }
-            if (const auto codec = sc::compression::detect(bytes)) bytes = codec->decompress(bytes);
+            const auto codec = sc::compression::detect(bytes);
+            if (packed == packing::gzip && (!codec || codec->name() != "gzip")) throw std::invalid_argument("it isn't gzipped");
+            if (codec) bytes = codec->decompress(bytes);
             if (bytes.size() >= MaxAllocHugeSize) throw std::runtime_error("it's too big to read");
             out.data = static_cast<char *>(MemoryContextAllocExtended(CurrentMemoryContext, bytes.size() + 1, MCXT_ALLOC_HUGE | MCXT_ALLOC_NO_OOM));
             if (!out.data) {
@@ -774,12 +788,12 @@ namespace {
         }
     }
 
-    // sc_read_csv and sc_read_csvzip: bytes, encoding, rows. PostgreSQL code: raises.
-    void read_csv_file(const char *function, const char *path, const char *entry, const char *encoding, const char delimiter, const int from_row,
-                       read_rows &out) {
+    // sc_read_csv, sc_read_csvzip and sc_read_csvgz: bytes, encoding, rows. PostgreSQL code: raises.
+    void read_csv_file(const char *function, const char *path, const packing packed, const char *entry, const char *encoding, const char delimiter,
+                       const int from_row, read_rows &out) {
         raw_bytes bytes;
         sc_pglib::pending_error error;
-        read_csv_bytes(function, path, entry, bytes, error);
+        read_csv_bytes(function, path, packed, entry, bytes, error);
         error.raise();
         to_database_encoding(function, encoding, bytes);
         parse_csv_rows(function, path, bytes, delimiter, from_row, out, error);
@@ -1003,8 +1017,6 @@ namespace {
         return *text;
     }
 
-    // The query's rows written as a CSV file at path, its columns' names first, or as the one entry of a
-    // ZIP archive at path when entry is given; then made readable by all. Never raises.
     // A query's rows as CSV values, its columns' names first
     sc::office::csv::sheet csv_of(const sheet_data &data) {
         sc::office::csv::sheet out;
@@ -1027,17 +1039,16 @@ namespace {
         return out;
     }
 
-    // The queries' rows written as a CSV file at path (the first query's), or as a ZIP archive at path
-    // with an entry per query (zip: each sheet_data's name is its entry); then made readable by all.
+    // The queries' rows written as a CSV file at path (the first query's), gzipped, or as a ZIP archive
+    // at path with an entry per query (each sheet_data's name is its entry); then made readable by all.
     // Never raises.
     //
-    // A path ending in .gz (not zip) is written gzipped. append (zip): the archive's other entries are
+    // A plain path ending in .gz is written gzipped too. append (zip): the archive's other entries are
     // kept, an entry of the same name replaced; without one there, it's made.
-    void write_csv(const char *path, const sheet_data *data, const int count, const char delimiter, const bool zip, const bool append,
-                   sc_pglib::pending_error &error) noexcept {
-        const char *function = zip ? "sc_csvzip" : "sc_csv";
+    void write_csv(const char *function, const char *path, const sheet_data *data, const int count, const char delimiter, const packing packed,
+                   const bool append, sc_pglib::pending_error &error) noexcept {
         try {
-            if (zip) {
+            if (packed == packing::zip) {
                 std::vector<std::pair<std::string, std::string>> kept;
                 struct stat there{};
                 if (append && ::stat(path, &there) == 0) {
@@ -1053,7 +1064,7 @@ namespace {
                 for (auto &[name, bytes]: kept) archive.add(name, std::move(bytes));
                 for (int i = 0; i < count; ++i) archive.add(data[i].name, sc::office::csv::bytes(csv_of(data[i]), {.delimiter = delimiter}));
                 archive.close();
-            } else if (std::string_view{path}.ends_with(".gz")) {
+            } else if (packed == packing::gzip || std::string_view{path}.ends_with(".gz")) {
                 const auto packed = sc::compression::gzip{}.compress(sc::office::csv::bytes(csv_of(data[0]), {.delimiter = delimiter}));
                 std::ofstream file{path, std::ios::binary | std::ios::trunc};
                 if (!file) throw std::runtime_error(std::string{"can't be written: "} + strerror(errno));
@@ -1116,9 +1127,9 @@ namespace {
         return 0;
     }
 
-    // sc_csv and sc_csvzip: the queries' rows written as a CSV file, or a ZIP archive of them (zip; each
-    // sheet's name its entry). PostgreSQL code: raises.
-    Datum make_csv(PG_FUNCTION_ARGS, const char *function, sheet_data *sheets, const int count, const bool zip, const int delimiter_argument,
+    // sc_csv, sc_csvzip and sc_csvgz: the queries' rows written as a CSV file, packed as packed says (zip:
+    // each sheet's name its entry). PostgreSQL code: raises.
+    Datum make_csv(PG_FUNCTION_ARGS, const char *function, sheet_data *sheets, const int count, const packing packed, const int delimiter_argument,
                    const int append_argument = -1) {
         const char *path = permitted_path(fcinfo, function, ROLE_PG_WRITE_SERVER_FILES);
         for (int i = 0; i < count; ++i)
@@ -1129,14 +1140,14 @@ namespace {
         const MemoryContext outer = CurrentMemoryContext;
         if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("%s: SPI_connect failed", function)));
         for (int i = 0; i < count; ++i)
-            run_query(sheets[i], outer, count > 1 || zip ? psprintf("%s: file \"%s\"", function, sheets[i].name) : function);
+            run_query(sheets[i], outer, count > 1 || packed == packing::zip ? psprintf("%s: file \"%s\"", function, sheets[i].name) : function);
         SPI_finish();
 
         int64 rows = 0;
         for (int i = 0; i < count; ++i) rows += static_cast<int64>(sheets[i].rows);
         sc_pglib::pending_error error;
         const bool append = append_argument >= 0 && PG_NARGS() > append_argument && PG_GETARG_BOOL(append_argument);
-        write_csv(path, sheets, count, delimiter, zip, append, error);
+        write_csv(function, path, sheets, count, delimiter, packed, append, error);
         error.raise();
         PG_RETURN_INT64(rows);
     }
@@ -1161,14 +1172,19 @@ namespace {
 
 // sc_csv(path text, query text, delimiter text) -> bigint
 extern "C" Datum sc_csv_query(PG_FUNCTION_ARGS) {
-    return make_csv(fcinfo, "sc_csv", one_query("csv", text_to_cstring(PG_GETARG_TEXT_PP(1))), 1, false, 2);
+    return make_csv(fcinfo, "sc_csv", one_query("csv", text_to_cstring(PG_GETARG_TEXT_PP(1))), 1, packing::plain, 2);
+}
+
+// sc_csvgz(path text, query text, delimiter text) -> bigint
+extern "C" Datum sc_csvgz_query(PG_FUNCTION_ARGS) {
+    return make_csv(fcinfo, "sc_csvgz", one_query("csv", text_to_cstring(PG_GETARG_TEXT_PP(1))), 1, packing::gzip, 2);
 }
 
 // sc_csvzip(path text, query text, entry text, delimiter text, append boolean) -> bigint
 extern "C" Datum sc_csvzip_query(PG_FUNCTION_ARGS) {
     const char *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
     const char *entry = csv_entry(path, PG_NARGS() > 2 ? text_to_cstring(PG_GETARG_TEXT_PP(2)) : "");
-    return make_csv(fcinfo, "sc_csvzip", one_query(entry, text_to_cstring(PG_GETARG_TEXT_PP(1))), 1, true, 3, 4);
+    return make_csv(fcinfo, "sc_csvzip", one_query(entry, text_to_cstring(PG_GETARG_TEXT_PP(1))), 1, packing::zip, 3, 4);
 }
 
 // sc_csvzip(path text, files json or jsonb, delimiter text, append boolean) -> bigint: a file per query
@@ -1184,7 +1200,7 @@ extern "C" Datum sc_csvzip_files(PG_FUNCTION_ARGS) {
     sc_pglib::pending_error error;
     const int count = read_entries(json, sheets, error);
     error.raise();
-    return make_csv(fcinfo, "sc_csvzip", sheets, count, true, 2, 3);
+    return make_csv(fcinfo, "sc_csvzip", sheets, count, packing::zip, 2, 3);
 }
 
 // sc_read_csvzip(path text, entry text, from_row integer, delimiter text, encoding text) -> SETOF record
@@ -1197,7 +1213,7 @@ extern "C" Datum sc_read_csvzip_rows(PG_FUNCTION_ARGS) {
     const char *encoding = PG_NARGS() > 4 ? text_to_cstring(PG_GETARG_TEXT_PP(4)) : "";
     const column_plan plan = plan_columns(fcinfo, "sc_read_csvzip");
     read_rows data;
-    read_csv_file("sc_read_csvzip", path, entry, encoding, delimiter, from_row, data);
+    read_csv_file("sc_read_csvzip", path, packing::zip, entry, encoding, delimiter, from_row, data);
     return put_rows(fcinfo, "sc_read_csvzip", plan, data);
 }
 
@@ -1210,6 +1226,19 @@ extern "C" Datum sc_read_csv_rows(PG_FUNCTION_ARGS) {
     const char *encoding = PG_NARGS() > 3 ? text_to_cstring(PG_GETARG_TEXT_PP(3)) : "";
     const column_plan plan = plan_columns(fcinfo, "sc_read_csv");
     read_rows data;
-    read_csv_file("sc_read_csv", path, nullptr, encoding, delimiter, from_row, data);
+    read_csv_file("sc_read_csv", path, packing::plain, nullptr, encoding, delimiter, from_row, data);
     return put_rows(fcinfo, "sc_read_csv", plan, data);
+}
+
+// sc_read_csvgz(path text, from_row integer, delimiter text, encoding text) -> SETOF record
+extern "C" Datum sc_read_csvgz_rows(PG_FUNCTION_ARGS) {
+    const char *path = readable_path(fcinfo, "sc_read_csvgz");
+    const int from_row = PG_NARGS() > 1 ? PG_GETARG_INT32(1) : 1;
+    if (from_row < 1) ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("sc_read_csvgz: rows are numbered from 1, not %d", from_row)));
+    const char delimiter = PG_NARGS() > 2 ? delimiter_of(text_to_cstring(PG_GETARG_TEXT_PP(2)), "sc_read_csvgz", true) : '\0';
+    const char *encoding = PG_NARGS() > 3 ? text_to_cstring(PG_GETARG_TEXT_PP(3)) : "";
+    const column_plan plan = plan_columns(fcinfo, "sc_read_csvgz");
+    read_rows data;
+    read_csv_file("sc_read_csvgz", path, packing::gzip, nullptr, encoding, delimiter, from_row, data);
+    return put_rows(fcinfo, "sc_read_csvgz", plan, data);
 }

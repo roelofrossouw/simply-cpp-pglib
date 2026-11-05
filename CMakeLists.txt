@@ -120,7 +120,7 @@ if (APPLE)
     endif ()
 endif ()
 
-set(SC_PGLIB_EXTENSION_FILES sql/sc_pglib.control sql/sc_pglib--1.0.sql sql/sc_pglib--1.0--1.1.sql sql/sc_pglib--1.1--1.2.sql sql/sc_pglib--1.2--1.3.sql sql/sc_pglib--1.3--1.4.sql sql/sc_pglib--1.4--1.5.sql sql/sc_pglib--1.5--1.6.sql sql/sc_pglib--1.6--1.7.sql sql/sc_pglib--1.7--1.8.sql sql/sc_pglib--1.8--1.9.sql sql/sc_pglib--1.9--1.10.sql sql/sc_pglib--1.10--1.11.sql sql/sc_pglib--1.11--1.12.sql sql/sc_pglib--1.12--1.13.sql sql/sc_pglib--1.13--1.14.sql sql/sc_pglib--1.14--1.15.sql sql/sc_pglib--1.15--1.16.sql)
+set(SC_PGLIB_EXTENSION_FILES sql/sc_pglib.control sql/sc_pglib--1.0.sql sql/sc_pglib--1.0--1.1.sql sql/sc_pglib--1.1--1.2.sql sql/sc_pglib--1.2--1.3.sql sql/sc_pglib--1.3--1.4.sql sql/sc_pglib--1.4--1.5.sql sql/sc_pglib--1.5--1.6.sql sql/sc_pglib--1.6--1.7.sql sql/sc_pglib--1.7--1.8.sql sql/sc_pglib--1.8--1.9.sql sql/sc_pglib--1.9--1.10.sql sql/sc_pglib--1.10--1.11.sql sql/sc_pglib--1.11--1.12.sql sql/sc_pglib--1.12--1.13.sql sql/sc_pglib--1.13--1.14.sql sql/sc_pglib--1.14--1.15.sql sql/sc_pglib--1.15--1.16.sql sql/sc_pglib--1.16--1.17.sql)
 if (SC_PGLIB_INSTALL)
     install(TARGETS sc_pglib LIBRARY DESTINATION "${SC_PGLIB_PG_PKGLIBDIR}" COMPONENT runtime)
     install(FILES ${SC_PGLIB_EXTENSION_FILES} DESTINATION "${SC_PGLIB_PG_SHAREDIR}/extension" COMPONENT runtime)

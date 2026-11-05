@@ -278,6 +278,10 @@ SELECT sc_csvzip('/var/www/data/output/export.zip',
 SELECT sc_csv('/var/www/data/output/dump/gl.csv.gz', 'select * from gl');
 SELECT * FROM sc_read_csv('/var/www/data/input/efile.csv', 2, encoding => 'windows-1251') AS x(a text, b text);
 SELECT sc_csvzip('/var/www/data/output/dump.zip', 'select * from more', 'more.csv', append => true);
+
+-- Gzipped whatever the name, and a gzipped file read back (anything else is an error)
+SELECT sc_csvgz('/var/www/data/output/gl.csv.gz', 'select * from gl');
+SELECT * FROM sc_read_csvgz('/var/www/data/input/prices.csv.gz', 2) AS x(a text, b numeric);
 ```
 
 | Function | Returns | |
@@ -287,6 +291,8 @@ SELECT sc_csvzip('/var/www/data/output/dump.zip', 'select * from more', 'more.cs
 | `sc_csvzip(path text, query text, entry text = '', delimiter text = ',', append boolean = false)` | `bigint` | `sc_csv`'s file as the one entry of a ZIP archive at `path` (deflated, an existing one replaced): `entry`, or the archive's name with `.csv`. With `append` (since 1.12) an existing archive's other entries are kept, and one of the same name replaced |
 | `sc_csvzip(path text, files json or jsonb, delimiter text = ',', append boolean = false)` | `bigint` | a CSV file per query, as `sc_xlsx` makes a sheet per query: `{"name.csv": "query", ...}`, names relative paths (`/` between folders); the rows of all files together. Give the files as `json` or `jsonb` explicitly: an untyped string is taken as a query |
 | `sc_read_csvzip(path text, entry text = '', from_row integer = 1, delimiter text = '', encoding text = '')` | `SETOF record` | that entry of a ZIP archive read as `sc_read_csv` reads a file. `entry` (since 1.12) may be a shell pattern, `*` and `?` (`'CodesAndDescriptionsFull*.csv'`, matched against the entry's file name when it has no `/`), or `''` for the archive's only `.csv` entry; an error naming the entries when none or more than one matches |
+| `sc_csvgz(path text, query text, delimiter text = ',')` | `bigint` | `sc_csv`'s file gzipped, whatever `path` is called (since 1.15.0, extension 1.17) |
+| `sc_read_csvgz(path text, from_row integer = 1, delimiter text = '', encoding text = '')` | `SETOF record` | a gzipped CSV file read as `sc_read_csv` reads one; an error when it isn't gzipped (since 1.15.0, extension 1.17) |
 
 Since extension 1.7.
 
@@ -627,11 +633,11 @@ writes aren't undone when the transaction rolls back.
   because `ereport()` `longjmp()`s past destructors.
 - `sql/sc_pglib.control` and the `sql/sc_pglib--*.sql` scripts are what `CREATE
   EXTENSION` reads: `sc_pglib--1.0.sql` (base64) and the updates `1.0--1.1`
-  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`), `1.4--1.5` (`sc_read_xlsx`), `1.5--1.6` (sheets as rows, `sc_xlsx_sheets`) `1.6--1.7` (`sc_csv`, `sc_read_csv`), `1.7--1.8` (`sc_mkdir`), `1.8--1.9` (`sc_csvzip`, `sc_read_csvzip`), `1.9--1.10` (`sc_csvzip` with several files), `1.10--1.11` (`sc_xlsx` with formatting) `1.11--1.12` (CSV gzipped, in an encoding and added to an archive; `sc_move`, `sc_list_files`, `sc_remove_log`), `1.12--1.13` (Firebase), `1.13--1.14` (Firebase foreign tables) `1.14--1.15` (`sc_fsc_emv`, `sc_fsc_solve_risk_prem`) and `1.15--1.16` (`sc_oneweb`, `sc_oneweb_config`). They and the module install into the server's own directories
+  (Redis), `1.1--1.2` (`hmget`, `hgetall`), `1.2--1.3` (sets), `1.3--1.4` (`sc_xlsx`), `1.4--1.5` (`sc_read_xlsx`), `1.5--1.6` (sheets as rows, `sc_xlsx_sheets`) `1.6--1.7` (`sc_csv`, `sc_read_csv`), `1.7--1.8` (`sc_mkdir`), `1.8--1.9` (`sc_csvzip`, `sc_read_csvzip`), `1.9--1.10` (`sc_csvzip` with several files), `1.10--1.11` (`sc_xlsx` with formatting) `1.11--1.12` (CSV gzipped, in an encoding and added to an archive; `sc_move`, `sc_list_files`, `sc_remove_log`), `1.12--1.13` (Firebase), `1.13--1.14` (Firebase foreign tables) `1.14--1.15` (`sc_fsc_emv`, `sc_fsc_solve_risk_prem`) `1.15--1.16` (`sc_oneweb`, `sc_oneweb_config`) and `1.16--1.17` (`sc_csvgz`, `sc_read_csvgz`). They and the module install into the server's own directories
   (`pg_config --sharedir`/extension and `--pkglibdir`).
-- The extension version (`1.16`) is separate from the package version. A package
+- The extension version (`1.17`) is separate from the package version. A package
   update replaces the module in place; adding or changing SQL objects needs a new
-  extension version with an update script (`sc_pglib--1.16--1.17.sql`), after which
+  extension version with an update script (`sc_pglib--1.17--1.18.sql`), after which
   databases run `ALTER EXTENSION sc_pglib UPDATE`.
 
 ## Building
