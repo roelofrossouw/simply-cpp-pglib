@@ -38,7 +38,8 @@
 //   SELECT * FROM sc_read_xlsx('/var/www/data/input/prices.xlsx', 1, 2) AS x("row" int, a text, b numeric);
 //
 // Reading is as COPY from a file (superusers and pg_read_server_files anywhere, an absolute path), and
-// every role in /var/www/data/output and below, as writing.
+// every role in /var/www/data/output and below, as writing, and also in the efile folders on each storage
+// tier (/var/www/{data,nvmedata,olddata}/efile) and below.
 //
 // Writing works in three steps, as pg_glue.h has it: the arguments read and checked (C++), the queries
 // run through SPI into plain data (PostgreSQL, which may raise), then the workbook made and
@@ -435,9 +436,10 @@ namespace {
         }
     }
 
-    // Why path isn't a place in the output folder (folders.h), or nullptr when it is. The reason is kept
-    // in a buffer of its own, so no C++ object is left behind when PostgreSQL raises the error.
-    const char *outside_output(const char *path) noexcept {
+    // Why path isn't a place in the output folder, or (reading) in an efile folder (folders.h), or nullptr when
+    // it is. The reason is the output folder's, kept in a buffer of its own, so no C++ object is left behind
+    // when PostgreSQL raises the error.
+    const char *outside_allowed(const char *path, const bool write) noexcept {
         static char reason[512];
         try {
             sc_pglib::check_inside(sc_pglib::output_folder, path);
@@ -447,22 +449,32 @@ namespace {
         } catch (...) {
             snprintf(reason, sizeof reason, "it can't be checked");
         }
+        if (!write) {
+            for (const char *folder: sc_pglib::efile_folders) {
+                try {
+                    sc_pglib::check_inside(folder, path);
+                    return nullptr;
+                } catch (...) {
+                }
+            }
+        }
         return reason;
     }
 
-    // The first argument, the file's path, as COPY allows it with one place open to all: a role with the
+    // The first argument, the file's path, as COPY allows it with some places open to all: a role with the
     // privileges of role (pg_read_server_files to read, pg_write_server_files to write) may use any
-    // absolute path; any other role only the output folder and below, with no symbolic link on the way.
-    // PostgreSQL code: raises.
+    // absolute path; any other role only the output folder and below, and to read also the efile folders
+    // and below, with no symbolic link on the way. PostgreSQL code: raises.
     const char *permitted_path(PG_FUNCTION_ARGS, const char *function, const Oid role) {
         const bool write = role == ROLE_PG_WRITE_SERVER_FILES;
         const char *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
         if (path[0] != '/') ereport(ERROR, (errcode(ERRCODE_INVALID_NAME), errmsg("%s: the path must be absolute: \"%s\"", function, path)));
         if (has_privs_of_role(GetUserId(), role)) return path;
-        if (const char *why = outside_output(path))
+        if (const char *why = outside_allowed(path, write))
             ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("%s: permission denied to %s a file", function, write ? "write" : "read"),
-                            errdetail("Only roles with the privileges of the \"%s\" role may, as with COPY %s a file; others only in %s: %s",
-                                      write ? "pg_write_server_files" : "pg_read_server_files", write ? "to" : "from", sc_pglib::output_folder, why)));
+                            errdetail("Only roles with the privileges of the \"%s\" role may, as with COPY %s a file; others only in %s%s: %s",
+                                      write ? "pg_write_server_files" : "pg_read_server_files", write ? "to" : "from", sc_pglib::output_folder,
+                                      write ? "" : " (and to read, the efile folders)", why)));
         return path;
     }
 

@@ -16,6 +16,10 @@ namespace sc_pglib {
     // Compiled in: no setting can change it.
     inline constexpr const char *output_folder = "/var/www/data/output";
 
+    // Where the file functions also let a role without pg_read_server_files read (not write): the efile
+    // folders on each storage tier. Compiled in, as output_folder.
+    inline constexpr const char *efile_folders[] = {"/var/www/data/efile", "/var/www/nvmedata/efile", "/var/www/olddata/efile"};
+
     // A file's place in root, checked as the paths below are (absolute, root or below it, no empty, "."
     // or ".." parts), with no symbolic link on the way: none of the folders below root, nor the file
     // itself when it's there, may be one. Throws std::runtime_error naming the path and why when it isn't.

@@ -250,7 +250,9 @@ A cell's value is a number, text or `true`/`false`; a number shown as a date or 
 - `json`, not `jsonb`, so the sheets keep their order; cast to `jsonb` to index into it.
 - The path is absolute. Superusers and roles with the privileges of
   `pg_read_server_files` may read anywhere, as with COPY; any other role only in
-  `/var/www/data/output` and below, with no symbolic link on the way.
+  `/var/www/data/output` and below (where PHP puts files for SQL to read), or in the efile folders
+  and below (`/var/www/data/efile`, `/var/www/nvmedata/efile`, `/var/www/olddata/efile`), with no
+  symbolic link on the way.
 
 ## CSV files
 

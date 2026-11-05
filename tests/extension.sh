@@ -343,6 +343,12 @@ check "~\"..\" part" "set role sc_pglib_writer; select sc_csv('/var/www/data/out
 # there in this test, so writing or reading the file itself is what fails)
 check "~sc_csv: \"/var/www/data/output/sc-pglib-test-none/x.csv\"" "set role sc_pglib_writer; select sc_csv('/var/www/data/output/sc-pglib-test-none/x.csv', 'select 1')"
 check "~sc_read_csv: \"/var/www/data/output/sc-pglib-test-none/x.csv\"" "set role sc_pglib_writer; select * from sc_read_csv('/var/www/data/output/sc-pglib-test-none/x.csv') as x(a text)"
+# The efile folders on each tier: reading gets past the permission check, writing doesn't
+check "~sc_read_csv: \"/var/www/data/efile/sc-pglib-test-none/x.csv\"" "set role sc_pglib_writer; select * from sc_read_csv('/var/www/data/efile/sc-pglib-test-none/x.csv') as x(a text)"
+check "~sc_read_csvzip: \"/var/www/olddata/efile/sc-pglib-test-none/x.zip\"" "set role sc_pglib_writer; select * from sc_read_csvzip('/var/www/olddata/efile/sc-pglib-test-none/x.zip') as x(a text)"
+check "~(and to read, the efile folders)" "set role sc_pglib_writer; select * from sc_read_csv('/var/www/data/config.ini') as x(a text)"
+check "~permission denied to write a file" "set role sc_pglib_writer; select sc_csv('/var/www/data/efile/sc-pglib-test-none/x.csv', 'select 1')"
+check "~permission denied to read a file" "set role sc_pglib_writer; select * from sc_read_csv('/var/www/data/efile/../config.ini') as x(a text)"
 
 if [ -n "${SC_REDIS_DEMO_SERVER:-}" ]; then
     prefix="sc-tmp:sc-pglib-test:$$"
