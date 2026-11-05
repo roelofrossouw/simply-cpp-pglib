@@ -78,8 +78,10 @@ SELECT sc_xlsx('/var/www/data/output/result.xlsx',
 | `sc_xlsx(path text, sheets json, formatting json)` | `bigint` | a sheet per query, `formatting` for all of them, a sheet's own over it |
 | `sc_xlsx(path text, sheets jsonb, formatting json)` | `bigint` | the same |
 
-- The rule is COPY's: only superusers and roles with the privileges of
-  `pg_write_server_files` may, and the path is absolute. The file is written as
+- The path is absolute. Superusers and roles with the privileges of
+  `pg_write_server_files` may write anywhere, as with COPY; any other role only in
+  `/var/www/data/output` and below, with no symbolic link on the way (as `sc_mkdir`
+  and the others; compiled in). The file is written as
   the server's operating system user (replacing one that's there) and made
   readable by all (0644), as PostgreSQL's own files aren't.
 - Each sheet has the columns' names in a bold first row that stays in view
@@ -246,8 +248,9 @@ A cell's value is a number, text or `true`/`false`; a number shown as a date or 
   14:05:06"` or `"14:05:06"`. A formula gives the value Excel last calculated (`null` when
   it never was); an error such as `#DIV/0!` is its text.
 - `json`, not `jsonb`, so the sheets keep their order; cast to `jsonb` to index into it.
-- The rule is COPY's: only superusers and roles with the privileges of
-  `pg_read_server_files` may, and the path is absolute.
+- The path is absolute. Superusers and roles with the privileges of
+  `pg_read_server_files` may read anywhere, as with COPY; any other role only in
+  `/var/www/data/output` and below, with no symbolic link on the way.
 
 ## CSV files
 

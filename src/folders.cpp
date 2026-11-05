@@ -164,6 +164,19 @@ namespace sc_pglib {
         }
     }
 
+    void check_inside(const std::string &root, const std::string_view path) {
+        const auto what = check(root, path);
+        for (std::size_t i = 1; i <= what.parts.size(); ++i) {
+            const auto here = joined(root, what.parts, i);
+            struct stat seen{};
+            if (::lstat(here.c_str(), &seen) != 0) {
+                if (errno == ENOENT) return; // not there (yet), and so nothing below it either
+                throw what.refuse(here + " can't be checked: " + std::strerror(errno));
+            }
+            if (S_ISLNK(seen.st_mode)) throw what.refuse(here + " is a symbolic link");
+        }
+    }
+
     std::string make_folders(const std::string &root, const std::string_view path) {
         const auto what = check(root, path);
         (void) open_folder(root, what, what.parts.size(), true);

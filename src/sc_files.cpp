@@ -42,7 +42,7 @@ PG_FUNCTION_INFO_V1(sc_remove_log);
 }
 
 namespace {
-    constexpr const char *output_root = "/var/www/data/output";
+    constexpr const char *output_root = sc_pglib::output_folder;
 
     struct varlena *made(const char *path, sc_pglib::pending_error &error) noexcept {
         try {

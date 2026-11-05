@@ -49,6 +49,23 @@ int main() {
     fs::create_directories(root);
     ::umask(0077); // as the server runs: the folders are 0755 all the same
 
+    SECTION("check_inside: a file's place in root, no link on the way, the file not there yet is fine");
+    {
+        fs::create_directories(root + "/inside/deeper");
+        std::ofstream{root + "/inside/file.csv"} << "a\n";
+        fs::create_symlink(scratch, root + "/inside/away");
+        fs::create_symlink(scratch / "elsewhere.csv", root + "/inside/link.csv");
+        const auto inside = [&](const std::string &path) { sc_pglib::check_inside(root, path); return true; };
+        CHECK(inside(root + "/inside/file.csv"));
+        CHECK(inside(root + "/inside/deeper/new.xlsx"));
+        CHECK(inside(root + "/missing/folder/new.csv"));
+        CHECK(refused_by([&] { inside(root + "/inside/away/x.csv"); }, "is a symbolic link"));
+        CHECK(refused_by([&] { inside(root + "/inside/link.csv"); }, "is a symbolic link"));
+        CHECK(refused_by([&] { inside(scratch.string() + "/x.csv"); }, "or a folder in it"));
+        CHECK(refused_by([&] { inside(root + "/inside/../../x.csv"); }, "\"..\" part"));
+        CHECK(refused_by([&] { inside("inside/file.csv"); }, "isn't an absolute path"));
+    }
+
     SECTION("Made with their parents, 0755; there already is fine; a trailing slash");
     {
         CHECK_EQ(sc_pglib::make_folders(root, root + "/omart/2026/Oct/"), root + "/omart/2026/Oct");

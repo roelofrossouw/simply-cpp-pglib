@@ -324,6 +324,12 @@ check "~permission denied to write a file" "set role sc_pglib_writer; select sc_
 check "~permission denied to read a file" "set role sc_pglib_writer; select * from sc_read_csvzip('$work/one.zip', 'one.csv') as x(a text)"
 check "~permission denied to write a file" "set role sc_pglib_writer; select sc_csvzip('$work/x.zip', 'select 1')"
 check "f" "select '$( [ -e "$work/x.xlsx" ] && echo t || echo f)'"
+check "~others only in /var/www/data/output" "set role sc_pglib_writer; select sc_csv('$work/x.csv', 'select 1')"
+check "~\"..\" part" "set role sc_pglib_writer; select sc_csv('/var/www/data/output/../x.csv', 'select 1')"
+# In the output folder a role without the privileges gets past the permission check (the folder isn't
+# there in this test, so writing or reading the file itself is what fails)
+check "~sc_csv: \"/var/www/data/output/sc-pglib-test-none/x.csv\"" "set role sc_pglib_writer; select sc_csv('/var/www/data/output/sc-pglib-test-none/x.csv', 'select 1')"
+check "~sc_read_csv: \"/var/www/data/output/sc-pglib-test-none/x.csv\"" "set role sc_pglib_writer; select * from sc_read_csv('/var/www/data/output/sc-pglib-test-none/x.csv') as x(a text)"
 
 if [ -n "${SC_REDIS_DEMO_SERVER:-}" ]; then
     prefix="sc-tmp:sc-pglib-test:$$"

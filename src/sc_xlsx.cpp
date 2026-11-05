@@ -1,6 +1,7 @@
 // Excel workbooks from SQL (sc::office::excel): queries' rows written as sheets of an .xlsx file
-// on the server, as COPY ... TO 'file' writes a CSV one, and with its rule: only superusers and
-// members of pg_write_server_files may, and the path is absolute. The file is written as the
+// on the server, as COPY ... TO 'file' writes a CSV one, and with its rule (the path absolute, and
+// superusers and members of pg_write_server_files anywhere), except that every role may write in
+// /var/www/data/output and below, with no symbolic link on the way (folders.h). The file is written as the
 // server's operating system user, then made readable by all (0644), as files for a web server
 // to send usually need.
 //
@@ -36,7 +37,8 @@
 //
 //   SELECT * FROM sc_read_xlsx('/var/www/data/input/prices.xlsx', 1, 2) AS x("row" int, a text, b numeric);
 //
-// Reading is as COPY from a file: superusers and pg_read_server_files only, an absolute path.
+// Reading is as COPY from a file (superusers and pg_read_server_files anywhere, an absolute path), and
+// every role in /var/www/data/output and below, as writing.
 //
 // Writing works in three steps, as pg_glue.h has it: the arguments read and checked (C++), the queries
 // run through SPI into plain data (PostgreSQL, which may raise), then the workbook made and
@@ -88,6 +90,7 @@
 #include <sys/stat.h>
 #include <vector>
 
+#include "folders.h"
 #include "pg_glue.h"
 #include "xlsx_format.h"
 
@@ -424,12 +427,39 @@ namespace {
         }
     }
 
-    Datum make_xlsx(FunctionCallInfo fcinfo, const char *sheets_json, const char *format_json, const std::string_view query, const std::string_view sheet_name) {
-        if (!has_privs_of_role(GetUserId(), ROLE_PG_WRITE_SERVER_FILES))
-            ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("sc_xlsx: permission denied to write a file"),
-                            errdetail("Only roles with the privileges of the \"pg_write_server_files\" role may, as with COPY to a file.")));
+    // Why path isn't a place in the output folder (folders.h), or nullptr when it is. The reason is kept
+    // in a buffer of its own, so no C++ object is left behind when PostgreSQL raises the error.
+    const char *outside_output(const char *path) noexcept {
+        static char reason[512];
+        try {
+            sc_pglib::check_inside(sc_pglib::output_folder, path);
+            return nullptr;
+        } catch (const std::exception &problem) {
+            snprintf(reason, sizeof reason, "%s", problem.what());
+        } catch (...) {
+            snprintf(reason, sizeof reason, "it can't be checked");
+        }
+        return reason;
+    }
+
+    // The first argument, the file's path, as COPY allows it with one place open to all: a role with the
+    // privileges of role (pg_read_server_files to read, pg_write_server_files to write) may use any
+    // absolute path; any other role only the output folder and below, with no symbolic link on the way.
+    // PostgreSQL code: raises.
+    const char *permitted_path(PG_FUNCTION_ARGS, const char *function, const Oid role) {
+        const bool write = role == ROLE_PG_WRITE_SERVER_FILES;
         const char *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
-        if (path[0] != '/') ereport(ERROR, (errcode(ERRCODE_INVALID_NAME), errmsg("sc_xlsx: the path must be absolute: \"%s\"", path)));
+        if (path[0] != '/') ereport(ERROR, (errcode(ERRCODE_INVALID_NAME), errmsg("%s: the path must be absolute: \"%s\"", function, path)));
+        if (has_privs_of_role(GetUserId(), role)) return path;
+        if (const char *why = outside_output(path))
+            ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("%s: permission denied to %s a file", function, write ? "write" : "read"),
+                            errdetail("Only roles with the privileges of the \"%s\" role may, as with COPY %s a file; others only in %s: %s",
+                                      write ? "pg_write_server_files" : "pg_read_server_files", write ? "to" : "from", sc_pglib::output_folder, why)));
+        return path;
+    }
+
+    Datum make_xlsx(FunctionCallInfo fcinfo, const char *sheets_json, const char *format_json, const std::string_view query, const std::string_view sheet_name) {
+        const char *path = permitted_path(fcinfo, "sc_xlsx", ROLE_PG_WRITE_SERVER_FILES);
 
         sc_pglib::pending_error error;
         sheet_data *sheets = nullptr;
@@ -777,14 +807,9 @@ namespace {
         return 0;
     }
 
-    // COPY's rule for reading a file: pg_read_server_files, an absolute path. PostgreSQL code: raises.
+    // The file to read, as permitted_path() allows it. PostgreSQL code: raises.
     const char *readable_path(PG_FUNCTION_ARGS, const char *function) {
-        if (!has_privs_of_role(GetUserId(), ROLE_PG_READ_SERVER_FILES))
-            ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("%s: permission denied to read a file", function),
-                            errdetail("Only roles with the privileges of the \"pg_read_server_files\" role may, as with COPY from a file.")));
-        const char *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
-        if (path[0] != '/') ereport(ERROR, (errcode(ERRCODE_INVALID_NAME), errmsg("%s: the path must be absolute: \"%s\"", function, path)));
-        return path;
+        return permitted_path(fcinfo, function, ROLE_PG_READ_SERVER_FILES);
     }
 
     // The function's rows go into a tuplestore of its result's shape. PostgreSQL code: raises.
@@ -1095,11 +1120,7 @@ namespace {
     // sheet's name its entry). PostgreSQL code: raises.
     Datum make_csv(PG_FUNCTION_ARGS, const char *function, sheet_data *sheets, const int count, const bool zip, const int delimiter_argument,
                    const int append_argument = -1) {
-        if (!has_privs_of_role(GetUserId(), ROLE_PG_WRITE_SERVER_FILES))
-            ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("%s: permission denied to write a file", function),
-                            errdetail("Only roles with the privileges of the \"pg_write_server_files\" role may, as with COPY to a file.")));
-        const char *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
-        if (path[0] != '/') ereport(ERROR, (errcode(ERRCODE_INVALID_NAME), errmsg("%s: the path must be absolute: \"%s\"", function, path)));
+        const char *path = permitted_path(fcinfo, function, ROLE_PG_WRITE_SERVER_FILES);
         for (int i = 0; i < count; ++i)
             if (std::string_view{sheets[i].query}.find_first_not_of(" \t\r\n") == std::string_view::npos)
                 ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("%s: the query is empty", function)));

@@ -11,6 +11,16 @@
 #include <vector>
 
 namespace sc_pglib {
+    // The folder tree sc_mkdir, sc_move and sc_list_files keep to, and the only place the file functions
+    // (sc_xlsx, sc_csv, sc_read_csv, ...) let a role without pg_read/write_server_files read or write.
+    // Compiled in: no setting can change it.
+    inline constexpr const char *output_folder = "/var/www/data/output";
+
+    // A file's place in root, checked as the paths below are (absolute, root or below it, no empty, "."
+    // or ".." parts), with no symbolic link on the way: none of the folders below root, nor the file
+    // itself when it's there, may be one. Throws std::runtime_error naming the path and why when it isn't.
+    void check_inside(const std::string &root, std::string_view path);
+
     // mkdir -p: path and its missing parents made (mode 0755, whatever the umask), given back without
     // a trailing slash. A folder that's there already is fine; anything else that's there (a file)
     // isn't.
