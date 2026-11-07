@@ -20,11 +20,13 @@ void _PG_init(void);
 
 namespace sc_pglib {
     void define_oneweb_settings(); // sc_oneweb.cpp
+    void define_text_settings();   // sc_text.cpp
 }
 
 // The module's settings, when it's loaded: sc_pglib.oneweb_config.
 extern "C" void _PG_init(void) {
     sc_pglib::define_oneweb_settings();
+    sc_pglib::define_text_settings();
 }
 
 namespace {

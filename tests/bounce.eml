@@ -1,0 +1,52 @@
+Return-Path: <>
+Received: by mx.example.com (Postfix) id 1A2B3C; Fri,  6 Nov 2026 10:00:00 +0200 (SAST)
+Date: Fri,  6 Nov 2026 10:00:00 +0200 (SAST)
+From: MAILER-DAEMON@mx.example.com (Mail Delivery System)
+Subject: Undelivered Mail Returned to Sender
+To: sender@example.com
+Message-Id: <20261106080000.1A2B3C@mx.example.com>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=delivery-status;
+	boundary="BOUNDARY1"
+
+This is a MIME-encapsulated message.
+
+--BOUNDARY1
+Content-Description: Notification
+Content-Type: text/plain; charset=us-ascii
+
+I'm sorry to have to inform you that your message could not be delivered.
+
+--BOUNDARY1
+Content-Description: Delivery report
+Content-Type: message/delivery-status
+
+Reporting-MTA: dns; mx.example.com
+X-Postfix-Queue-ID: 1A2B3C
+X-Postfix-Sender: rfc822; sender@example.com
+Arrival-Date: Fri,  6 Nov 2026 09:59:58 +0200 (SAST)
+
+Final-Recipient: rfc822; nobody@example.org
+Original-Recipient: rfc822;nobody@example.org
+Action: failed
+Status: 5.1.1
+Remote-MTA: dns; mx.example.org
+Diagnostic-Code: smtp; 550 5.1.1 <nobody@example.org>: Recipient address
+    rejected: User unknown in virtual mailbox table
+
+--BOUNDARY1
+Content-Description: Undelivered Message Headers
+Content-Type: text/rfc822-headers
+
+Return-Path: <sender@example.com>
+Received: from app1.example.com (app1.example.com [192.0.2.10])
+	by mx.example.com (Postfix) with ESMTP id 1A2B3C
+	for <nobody@example.org>; Fri,  6 Nov 2026 09:59:58 +0200 (SAST)
+Received: from localhost by app1.example.com; Fri, 6 Nov 2026 09:59:57 +0200
+DKIM-Signature: v=1; a=rsa-sha256; d=example.com; s=x; b=abc
+message-id: <abc123@app1.example.com>
+To: nobody@example.org
+From: sender@example.com
+Subject: Statement
+
+--BOUNDARY1--

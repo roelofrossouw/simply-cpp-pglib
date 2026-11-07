@@ -60,7 +60,7 @@ if [ "$major" -ge 18 ]; then
     check_extension=1
 else
     echo "PostgreSQL $major: running the extension scripts directly (CREATE EXTENSION of an uninstalled extension needs 18)"
-    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql sc_pglib--1.7--1.8.sql sc_pglib--1.8--1.9.sql sc_pglib--1.9--1.10.sql sc_pglib--1.10--1.11.sql sc_pglib--1.11--1.12.sql sc_pglib--1.12--1.13.sql sc_pglib--1.13--1.14.sql sc_pglib--1.14--1.15.sql sc_pglib--1.15--1.16.sql sc_pglib--1.16--1.17.sql; do
+    for step in sc_pglib--1.0.sql sc_pglib--1.0--1.1.sql sc_pglib--1.1--1.2.sql sc_pglib--1.2--1.3.sql sc_pglib--1.3--1.4.sql sc_pglib--1.4--1.5.sql sc_pglib--1.5--1.6.sql sc_pglib--1.6--1.7.sql sc_pglib--1.7--1.8.sql sc_pglib--1.8--1.9.sql sc_pglib--1.9--1.10.sql sc_pglib--1.10--1.11.sql sc_pglib--1.11--1.12.sql sc_pglib--1.12--1.13.sql sc_pglib--1.13--1.14.sql sc_pglib--1.14--1.15.sql sc_pglib--1.15--1.16.sql sc_pglib--1.16--1.17.sql sc_pglib--1.17--1.18.sql; do
         sed -e '/^\\echo/d' -e "s|MODULE_PATHNAME|$library|g" "$sql_dir/$step" | psql_run
     done
     check_extension=0
@@ -596,16 +596,61 @@ else
     echo "skipped: sc_oneweb (no openssl or python3)"
 fi
 
+# --- 1.18: what 1web's plperlu and plpython3u functions did ---
+check "Café &lt;b&gt; &amp; &quot;x&#x27; &euro;5 中 &#x1f600;" "select sc_html_encode('Café <b> & \"x'' €5 中 😀')"
+check "café <3 © ≂̸ &bogus; &AEligx Æ!" "select sc_html_decode('caf&eacute; &lt;3 &#169 &NotEqualTilde; &bogus; &AEligx &AElig!')"
+check "t" "select sc_html_encode(null) is null and sc_html_decode(null) is null"
+check "a%20b%2F%C3%A9~-._%2A%21" "select sc_uri_encode('a b/é~-._*!')"
+check "t" "select sc_reverse_dns('127.0.0.1') is not null"
+check "t" "select sc_reverse_dns('::1'::inet) is not null or true"
+check "Status=5.1.1|Action=failed|Message-ID=<abc123@app1.example.com>|Reporting-Mta=dns; mx.example.com" "select 'Status=' || (d->>'Status') || '|Action=' || (d->>'Action') || '|Message-ID=' || (d->>'Message-ID') || '|Reporting-Mta=' || (d->>'Reporting-Mta') from sc_read_dsn('$(cd "$(dirname "$0")" && pwd)/bounce.eml') d"
+check "13" "select count(*) from jsonb_object_keys(sc_read_dsn('$(cd "$(dirname "$0")" && pwd)/bounce.eml'))"
+check "8" "select sc_write_text('$work/a.json', '{\"a\": 1}')"
+check "18" "select sc_write_text('$work/a.json', ',{\"b\": 2}', true) + 9"
+check "{\"a\": 1},{\"b\": 2}" "select sc_read_text('$work/a.json')"
+check "~ERROR:  sc_read_text: \"$work/none.json\": No such file" "select sc_read_text('$work/none.json')"
+printf 'ok \xff\n' > "$work/bad.txt"
+check "~ERROR:  invalid byte sequence for encoding \"UTF8\"" "select sc_read_text('$work/bad.txt')"
+check "" "create role sc_text_tester"
+check "~permission denied for function sc_read_text" "set role sc_text_tester; select sc_read_text('/etc/hosts')"
+check "~permission denied for function sc_http_get" "set role sc_text_tester; select sc_http_get('https://csv.webfleet.com/extern')"
+check "~isn't under any of sc_pglib.http_urls" "select sc_http_get('https://example.com/')"
+check "~isn't under any of sc_pglib.http_urls" "select sc_http_get('https://csv.webfleet.com/externx')"
+check "~isn't under any of sc_pglib.http_urls" "select sc_http_get('https://csv.webfleet.com/extern/../admin')"
+check "~isn't under any of sc_pglib.http_urls" "select sc_http_get('https://user@csv.webfleet.com/extern')"
+check "~cannot be changed now" "select sc_uri_encode('loaded'); set sc_pglib.http_urls = 'https://example.com'"
+check "~timeout_ms must be 1000 to 300000" "select sc_http_get('https://csv.webfleet.com/extern', null, null, 5)"
+# A real GET, against tests/http_server.py, once sc_pglib.http_urls lets its /api through
+if command -v python3 >/dev/null; then
+    python3 "$(dirname "$0")/http_server.py" >"$work/http.port" 2>"$work/http_server.log" &
+    http_server=$!
+    for _ in $(seq 50); do grep -q listening "$work/http.port" && break; sleep 0.1; done
+    http_port=$(awk '/listening/ {print $2}' "$work/http.port")
+    check "" "alter system set sc_pglib.http_urls = 'http://127.0.0.1:$http_port/api'"
+    check "t" "select pg_reload_conf()"
+    sleep 0.5
+    check "200|application/json|{\"e\": \"\", \"n\": \"5\", \"t\": \"true\", \"a b\": \"1&2\"}|hi" "select (r->>'status') || '|' || (r->>'content_type') || '|' || ((r->'json'->'params')::text) || '|' || (r->'json'->>'header') from sc_http_get('http://127.0.0.1:$http_port/api/echo', '{\"a b\": \"1&2\", \"n\": 5, \"t\": true, \"e\": null}', '{\"X-Test\": \"hi\"}') r"
+    check "404|plain words|true" "select (r->>'status') || '|' || (r->>'body') || '|' || (r->'json' = 'null'::jsonb) from sc_http_get('http://127.0.0.1:$http_port/api/text') r"
+    check "302" "select sc_http_get('http://127.0.0.1:$http_port/api/redirect')->>'status'"
+    check "~isn't under any of sc_pglib.http_urls" "select sc_http_get('http://127.0.0.1:$http_port/other')"
+    check "" "alter system reset sc_pglib.http_urls"
+    check "t" "select pg_reload_conf()"
+    kill "$http_server" 2>/dev/null || true
+    wait "$http_server" 2>/dev/null || true
+else
+    echo "skipped: sc_http_get against a server (no python3)"
+fi
+
 if [ "$check_extension" = 1 ]; then
-    check "sc_pglib|1.17" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.18" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "" "set client_min_messages = warning; drop extension sc_pglib cascade"
-    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname like 'sc_firebase%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_mkdir', 'sc_xlsx_sheets', 'sc_csv', 'sc_read_csv', 'sc_csvzip', 'sc_read_csvzip', 'sc_csvgz', 'sc_read_csvgz', 'sc_move', 'sc_list_files', 'sc_remove_log', 'sc_fsc_emv', 'sc_fsc_solve_risk_prem', 'sc_oneweb', 'sc_oneweb_config'))"
+    check "f" "select exists (select 1 from pg_proc where proname like 'sc_base64%' or proname like 'sc_redis%' or proname like 'sc_firebase%' or proname in ('sc_xlsx', 'sc_read_xlsx', 'sc_mkdir', 'sc_xlsx_sheets', 'sc_csv', 'sc_read_csv', 'sc_csvzip', 'sc_read_csvzip', 'sc_csvgz', 'sc_read_csvgz', 'sc_move', 'sc_list_files', 'sc_remove_log', 'sc_fsc_emv', 'sc_fsc_solve_risk_prem', 'sc_oneweb', 'sc_oneweb_config', 'sc_html_encode', 'sc_html_decode', 'sc_uri_encode', 'sc_reverse_dns', 'sc_read_dsn', 'sc_read_text', 'sc_write_text', 'sc_http_get'))"
     # Updating from 1.0, as an existing database does.
     check "" "create extension sc_pglib version '1.0'"
     check "f" "select exists (select 1 from pg_proc where proname = 'sc_redis_get')"
     # 1.14 gives sc_firebase a handler, which PostgreSQL warns about (no foreign tables exist yet).
     check "~changing the foreign-data wrapper handler" "alter extension sc_pglib update"
-    check "sc_pglib|1.17" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
+    check "sc_pglib|1.18" "select extname, extversion from pg_extension where extname = 'sc_pglib'"
     check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_redis')"
     check "t" "select exists (select 1 from pg_foreign_data_wrapper where fdwname = 'sc_firebase')"
     check "7" "select count(*) from pg_proc where proname like 'sc_firebase_%' and proname not in ('sc_firebase_validator', 'sc_firebase_fdw_handler')"
@@ -619,6 +664,7 @@ if [ "$check_extension" = 1 ]; then
     check "4" "select count(*) from pg_proc where proname in ('sc_csvzip', 'sc_read_csvzip')"
     check "2" "select count(*) from pg_proc where proname in ('sc_fsc_emv', 'sc_fsc_solve_risk_prem')"
     check "2" "select count(*) from pg_proc where proname in ('sc_oneweb', 'sc_oneweb_config')"
+    check "8" "select count(*) from pg_proc where proname in ('sc_html_encode', 'sc_html_decode', 'sc_uri_encode', 'sc_reverse_dns', 'sc_read_dsn', 'sc_read_text', 'sc_write_text', 'sc_http_get')"
 fi
 
 if [ "$failures" -ne 0 ]; then

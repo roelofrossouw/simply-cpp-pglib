@@ -440,6 +440,37 @@ A cancel (`pg_cancel_backend`, `statement_timeout`) or a terminate stops the tra
 bodies and the key never go into the server's log; at `DEBUG1` it says the name, the HTTP status and
 the milliseconds.
 
+## Text, bounces and HTTP (since 1.18)
+
+What 1web's plperlu and plpython3u functions did, natively, so the database can drop the untrusted
+languages (they run as the postgres user for whoever calls them):
+
+| Function | Does | Replaces |
+|---|---|---|
+| `sc_html_encode(text)` | HTML entities as Perl's HTML::HTML5::Entities encodes them | `html_encode` |
+| `sc_html_decode(text)` | every HTML5 named, decimal and hex reference decoded | `html_decode_work` |
+| `sc_uri_encode(text)` | every byte but `A-Z a-z 0-9 - . _ ~` as `%XX` | `uri_encode` |
+| `sc_reverse_dns(inet)` | the address' name in reverse DNS, NULL when none | `gethostbyaddr` |
+| `sc_read_dsn(path)` | a bounce's fields as jsonb (Status, Action, Diagnostic-Code, Message-ID ...) | `correspondence.read_dsn` |
+| `sc_read_text(path)` | a text file's content | the TruckAssist JSON files' Python |
+| `sc_write_text(path, text, append = false)` | a text file written or appended to; its bytes | the same; `hr.queue_slips`' mailparams |
+| `sc_http_get(url, params, headers, timeout_ms)` | an HTTP GET: `{status, content_type, body, json}` | `truckassist.webfleet_video_link` |
+
+The file functions keep to the places the others do (read: the output and efile folders; write: the
+output folder; any path for roles with `pg_read_server_files`/`pg_write_server_files`).
+`sc_http_get` fetches only URLs under `sc_pglib.http_urls`, a list set in postgresql.conf (or
+`ALTER SYSTEM`), commas between: `https://host` allows any path there, `https://host/path` that path
+and below. Its default holds what the Python functions fetched (Webfleet's `/extern`, Firebase and
+Google's sign-in). It follows no redirects; `params` go into the query (`'{"action": "x"}'`).
+`sc_read_dsn`, `sc_read_text`, `sc_write_text` and `sc_http_get` are revoked from PUBLIC: grant
+them, or SECURITY DEFINER wrappers, to the roles that need them.
+
+```sql
+SELECT sc_html_encode('Café <b> & €5');                       -- Café &lt;b&gt; &amp; &euro;5
+SELECT sc_read_dsn('/var/www/data/output/dsn/1234.eml') ->> 'Status';
+SELECT sc_http_get('https://csv.webfleet.com/extern', '{"action": "showVideoLink"}') -> 'json';
+```
+
 ## Redis
 
 `sc_pglib` talks to Redis (standalone or Cluster) through `sc::redis`, mainly
