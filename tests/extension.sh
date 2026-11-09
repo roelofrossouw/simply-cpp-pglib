@@ -608,6 +608,19 @@ check "13" "select count(*) from jsonb_object_keys(sc_read_dsn('$(cd "$(dirname 
 check "8" "select sc_write_text('$work/a.json', '{\"a\": 1}')"
 check "18" "select sc_write_text('$work/a.json', ',{\"b\": 2}', true) + 9"
 check "{\"a\": 1},{\"b\": 2}" "select sc_read_text('$work/a.json')"
+# A new file is readable by all despite the server's umask (077); an existing one keeps its mode.
+mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+if [ "$(mode_of "$work/a.json")" != "644" ]; then
+    echo "FAIL: sc_write_text made $work/a.json mode $(mode_of "$work/a.json"), not 644"
+    failures=$((failures + 1))
+fi
+check "1" "select sc_write_text('$work/a.json', 'x')"
+chmod 600 "$work/a.json"
+check "1" "select sc_write_text('$work/a.json', 'y')"
+if [ "$(mode_of "$work/a.json")" != "600" ]; then
+    echo "FAIL: sc_write_text changed an existing file's mode to $(mode_of "$work/a.json")"
+    failures=$((failures + 1))
+fi
 check "~ERROR:  sc_read_text: \"$work/none.json\": No such file" "select sc_read_text('$work/none.json')"
 printf 'ok \xff\n' > "$work/bad.txt"
 check "~ERROR:  invalid byte sequence for encoding \"UTF8\"" "select sc_read_text('$work/bad.txt')"

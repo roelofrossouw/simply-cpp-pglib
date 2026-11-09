@@ -142,9 +142,21 @@ namespace {
         return nullptr;
     }
 
-    // The bytes written, or -1 with error set. A new file is made readable by all (0644). Never raises.
+    // The bytes written, or -1 with error set. A new file is made readable by all (0644): the server's umask
+    // (077) would leave it to postgres alone, which the programs that collect these files (as other users,
+    // over NFS) can't read; an existing file keeps its mode. Never raises.
     int64 write_file(const char *path, const std::string_view text, const bool append, sc_pglib::pending_error &error) noexcept {
-        const int fd = ::open(path, O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC | (append ? O_APPEND : O_TRUNC), 0644);
+        const int flags = O_WRONLY | O_NOFOLLOW | O_CLOEXEC | (append ? O_APPEND : O_TRUNC);
+        int fd = ::open(path, flags);
+        if (fd < 0 && errno == ENOENT) {
+            fd = ::open(path, flags | O_CREAT | O_EXCL, 0644);
+            if (fd < 0 && errno == EEXIST) fd = ::open(path, flags); // made by someone else meanwhile
+            else if (fd >= 0 && ::fchmod(fd, 0644) != 0) {
+                error.set(ERRCODE_IO_ERROR, ERROR, "sc_write_text: \"%s\": %s", path, strerror(errno));
+                ::close(fd);
+                return -1;
+            }
+        }
         if (fd < 0) {
             error.set(ERRCODE_IO_ERROR, ERROR, "sc_write_text: \"%s\": %s", path, strerror(errno));
             return -1;
