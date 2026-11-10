@@ -1246,6 +1246,8 @@ namespace sc_pglib {
     // and below, with no symbolic link on the way. PostgreSQL code: raises.
     const char *permitted_path(PG_FUNCTION_ARGS, const char *function, const Oid role) {
         const bool write = role == ROLE_PG_WRITE_SERVER_FILES;
+        // A non-strict caller (sc_write_text) gets NULL here: an error, never a NULL pointer (that crashed the backend)
+        if (PG_ARGISNULL(0)) ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("%s: the path can't be NULL", function)));
         const char *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
         if (path[0] != '/') ereport(ERROR, (errcode(ERRCODE_INVALID_NAME), errmsg("%s: the path must be absolute: \"%s\"", function, path)));
         if (has_privs_of_role(GetUserId(), role)) return path;

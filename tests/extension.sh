@@ -621,6 +621,11 @@ if [ "$(mode_of "$work/a.json")" != "600" ]; then
     echo "FAIL: sc_write_text changed an existing file's mode to $(mode_of "$work/a.json")"
     failures=$((failures + 1))
 fi
+# A NULL path is an error, not a crash: sc_write_text isn't strict (it raises on NULL text itself), and a NULL
+# path took db3's backend down (2026-11-10, sc_pglib 1.18)
+check "~ERROR:  sc_write_text: the path can't be NULL" "select sc_write_text(null, 'x')"
+check "~ERROR:  sc_write_text: the path can't be NULL" "select sc_write_text(null::text, null::text, true)"
+check "t" "select true"
 check "~ERROR:  sc_read_text: \"$work/none.json\": No such file" "select sc_read_text('$work/none.json')"
 printf 'ok \xff\n' > "$work/bad.txt"
 check "~ERROR:  invalid byte sequence for encoding \"UTF8\"" "select sc_read_text('$work/bad.txt')"
