@@ -20,7 +20,7 @@ message(STATUS "SimplyCPP ${SC_MODULE} Version: ${SC_VERSION}")
 # Dependencies #
 ################
 find_or_install_package(sc-core simply-cpp-dev simply-cpp 2.1.0) # ip_endpoint::host_name (sc_reverse_dns)
-find_or_install_package(sc-redis simply-cpp-redis-dev simply-cpp-redis 1.3.0)
+find_or_install_package(sc-redis simply-cpp-redis-dev simply-cpp-redis 1.6.0) # linked statically; 1.6.0: commands go to their slot's master
 find_or_install_package(sc-firebase simply-cpp-firebase-dev simply-cpp-firebase 1.0.0) # the Realtime Database
 find_or_install_package(sc-office simply-cpp-office-dev simply-cpp-office 1.11.0)
 # An insurer's capital and reserving calculations (sc_fsc_emv, sc_fsc_solve_risk_prem).
