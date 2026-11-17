@@ -1,11 +1,11 @@
 # Several copies of these helpers get included in one configure: sc-core's, and the copy each module's
 # package config includes. A copy older than one already included returns here instead of replacing
-# its functions with older ones (helpers 36 on; copies before 36 don't check). Keep both 36s here in step
+# its functions with older ones (helpers 36 on; copies before 36 don't check). Keep both numbers here in step
 # with SC_HELPERS_VERSION below.
-if (DEFINED SC_HELPERS_LOADED_VERSION AND SC_HELPERS_LOADED_VERSION GREATER 36)
+if (DEFINED SC_HELPERS_LOADED_VERSION AND SC_HELPERS_LOADED_VERSION GREATER 37)
     return()
 endif ()
-set(SC_HELPERS_LOADED_VERSION 36)
+set(SC_HELPERS_LOADED_VERSION 37)
 
 # Keep project()/cmake_minimum_required() in the top-level CMakeLists.txt.
 # Only the post-project C++/PIC defaults are safe here.
@@ -33,7 +33,7 @@ elseif (UNIX)
     set(CMAKE_INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
 endif ()
 
-set(SC_HELPERS_VERSION 36)
+set(SC_HELPERS_VERSION 37)
 set(SC_VERSION_FILE "VERSION.txt")
 set(SC_VERSION_DEFAULT "1.0.0")
 
@@ -349,8 +349,16 @@ function(add_sc_object object)
     set_target_properties(${object_name} PROPERTIES EXCLUDE_FROM_ALL ON)
     target_include_directories(${object_name} PRIVATE ${INCLUDE} ${SC_OBJECT_INCLUDE_DIRS})
 
-    if (SC_OBJECT_LINK_LIBRARIES)
-        target_link_libraries(${object_name} PRIVATE ${SC_OBJECT_LINK_LIBRARIES})
+    # What the object compiles against: its own libraries, the ones it makes public, and sc-core, which
+    # every module's headers use. Linking a target gives its include folder; before the headers moved to
+    # include/sc/<module>/ an object that named none of them still found the flat headers in /usr/include.
+    set(object_links ${SC_OBJECT_LINK_LIBRARIES} ${SC_OBJECT_PUBLIC_LINK_LIBRARIES})
+    if (TARGET sc::sc-core)
+        list(APPEND object_links sc::sc-core)
+    endif ()
+    if (object_links)
+        list(REMOVE_DUPLICATES object_links)
+        target_link_libraries(${object_name} PRIVATE ${object_links})
     endif ()
 
     list(APPEND SOURCE_OBJECTS $<TARGET_OBJECTS:${object_name}>)
