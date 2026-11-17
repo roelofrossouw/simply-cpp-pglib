@@ -19,14 +19,14 @@ message(STATUS "SimplyCPP ${SC_MODULE} Version: ${SC_VERSION}")
 ################
 # Dependencies #
 ################
-find_or_install_package(sc-core simply-cpp-dev simply-cpp 2.2.0) # ip_endpoint::host_name (sc_reverse_dns)
-find_or_install_package(sc-redis simply-cpp-redis-dev simply-cpp-redis 1.7.0) # linked statically; 1.6.0: commands go to their slot's master
-find_or_install_package(sc-firebase simply-cpp-firebase-dev simply-cpp-firebase 1.1.0) # the Realtime Database
-find_or_install_package(sc-office simply-cpp-office-dev simply-cpp-office 1.13.0)
+find_or_install_package(sc-core simply-cpp-dev simply-cpp 3.0.0) # ip_endpoint::host_name (sc_reverse_dns)
+find_or_install_package(sc-redis simply-cpp-redis-dev simply-cpp-redis 2.0.0) # linked statically; 1.6.0: commands go to their slot's master
+find_or_install_package(sc-firebase simply-cpp-firebase-dev simply-cpp-firebase 2.0.0) # the Realtime Database
+find_or_install_package(sc-office simply-cpp-office-dev simply-cpp-office 2.0.0)
 # What 1web's plperlu and plpython3u functions did (sc_text.cpp): HTML entities, bounces, HTTP GET.
-find_or_install_package(sc-web simply-cpp-web-dev simply-cpp-web 1.6.0)
-find_or_install_package(sc-mime simply-cpp-mime-dev simply-cpp-mime 1.5.0)
-find_or_install_package(sc-http simply-cpp-http-dev simply-cpp-http 1.2.0)
+find_or_install_package(sc-web simply-cpp-web-dev simply-cpp-web 2.0.0)
+find_or_install_package(sc-mime simply-cpp-mime-dev simply-cpp-mime 2.0.0)
+find_or_install_package(sc-http simply-cpp-http-dev simply-cpp-http 2.0.0)
 
 ## PostgreSQL server ##
 # An extension is built for one PostgreSQL major version. Each Ubuntu release builds for a fixed
@@ -100,8 +100,8 @@ message(STATUS "Building for ${SC_PGLIB_PG_VERSION} (${SC_PGLIB_PG_CONFIG})")
 # later look for ".dylib" there.
 add_library(sc_pglib MODULE src/sc_pglib.cpp src/sc_redis.cpp src/sc_firebase.cpp src/firebase_rows.cpp src/sc_xlsx.cpp src/xlsx_format.cpp src/sc_files.cpp src/folders.cpp src/sc_fsc.cpp src/fsc/fsc.cpp src/sc_oneweb.cpp src/oneweb.cpp src/sc_text.cpp src/http_allowed.cpp)
 target_include_directories(sc_pglib PRIVATE "${SC_PGLIB_PG_INCLUDEDIR}")
-# sc::sc-redis brings sc::sc-core (base64) with it.
-target_link_libraries(sc_pglib PRIVATE sc::sc-redis)
+# sc::sc-redis-shared brings sc::sc-core-shared (base64) with it.
+target_link_libraries(sc_pglib PRIVATE sc::sc-redis-shared)
 # sc-firebase's shared library: it brings libcurl (sc::rest) and OpenSSL with it.
 target_link_libraries(sc_pglib PRIVATE sc::sc-firebase-shared)
 # sc-office's shared library (its zip and XML underneath come with it), as sc-phplib links it.
@@ -163,7 +163,7 @@ if (SC_PGLIB_BUILD_TESTS)
     # An insurer's capital and reserving calculations (src/fsc, once the sc-fsc module), without PostgreSQL.
     add_executable(test-fsc tests/fsc.cpp src/fsc/fsc.cpp)
     target_include_directories(test-fsc PRIVATE src tests)
-    target_link_libraries(test-fsc PRIVATE sc::sc-core)
+    target_link_libraries(test-fsc PRIVATE sc::sc-core-shared)
     add_test(NAME test-fsc COMMAND test-fsc)
     set_tests_properties(test-fsc PROPERTIES LABELS unit)
 endif ()
@@ -171,4 +171,4 @@ endif ()
 #############
 # Packaging #
 #############
-package_sc_module(DEPENDS "postgresql-${SC_PGLIB_PG_MAJOR}" "simply-cpp (>= 2.2.0~)" "simply-cpp-office (>= 1.13.0~)" "simply-cpp-firebase (>= 1.1.0~)" "simply-cpp-http (>= 1.2.0~)" "simply-cpp-web (>= 1.6.0~)" "simply-cpp-mime (>= 1.5.0~)")
+package_sc_module(DEPENDS "simply-cpp-redis (>= 2.0.0~)" "postgresql-${SC_PGLIB_PG_MAJOR}" "simply-cpp (>= 3.0.0~)" "simply-cpp-office (>= 2.0.0~)" "simply-cpp-firebase (>= 2.0.0~)" "simply-cpp-http (>= 2.0.0~)" "simply-cpp-web (>= 2.0.0~)" "simply-cpp-mime (>= 2.0.0~)")
