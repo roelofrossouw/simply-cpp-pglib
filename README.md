@@ -340,10 +340,11 @@ SELECT path FROM sc_list_files('/var/www/data/output/queue/123', '1 minute', 100
 'log/<name>'`): `true`, or `false` when it isn't there. Only a plain file name, never the file the
 server writes to now (`current_logfiles`). Since 1.12; `EXECUTE` is revoked from `PUBLIC`.
 
-## Capital and reserving (sc-fsc)
+## Capital and reserving
 
 Expected cash flows valued at a risk premium, and the risk premium solved from a market value, by
-[sc-fsc](https://github.com/roelofrossouw/simply-cpp-fsc): Newton-Raphson with the derivative exact. The
+`src/fsc` (`sc::fsc`, once the separate sc-fsc module): Newton-Raphson with the derivative exact (sc-core's
+dual numbers). The
 arguments are those of the goalseek extension's `emv_cpp` and `solve_risk_prem`, so a query only changes
 the function's name.
 
@@ -658,7 +659,7 @@ writes aren't undone when the transaction rolls back.
 
 - The module (`sc_pglib.so`, or `sc_pglib.dylib` on macOS) is a PostgreSQL
   loadable module using the version-1 calling convention: `src/sc_pglib.cpp`
-  (base64), `src/sc_redis.cpp` (Redis), `src/sc_xlsx.cpp` (Excel workbooks and CSV files), `src/xlsx_format.cpp` (a sheet's formatting) and `src/sc_files.cpp` with `src/folders.cpp` (files, folders and the server's logs), `src/sc_fsc.cpp` (capital and reserving, by sc-fsc's shared library),
+  (base64), `src/sc_redis.cpp` (Redis), `src/sc_xlsx.cpp` (Excel workbooks and CSV files), `src/xlsx_format.cpp` (a sheet's formatting) and `src/sc_files.cpp` with `src/folders.cpp` (files, folders and the server's logs), `src/sc_fsc.cpp` with `src/fsc/` (capital and reserving),
   linking `sc::sc-redis` and `sc::sc-core` statically, and hiredis and
   sc-office's shared library dynamically. `src/pg_glue.h` has the rules
   for mixing C++ and PostgreSQL: C++ exceptions never reach PostgreSQL, and

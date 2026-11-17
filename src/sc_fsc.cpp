@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#include <sc_fsc.h>
+#include "fsc/fsc.h"
 
 #include "pg_glue.h"
 

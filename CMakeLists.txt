@@ -23,8 +23,6 @@ find_or_install_package(sc-core simply-cpp-dev simply-cpp 2.1.0) # ip_endpoint::
 find_or_install_package(sc-redis simply-cpp-redis-dev simply-cpp-redis 1.6.0) # linked statically; 1.6.0: commands go to their slot's master
 find_or_install_package(sc-firebase simply-cpp-firebase-dev simply-cpp-firebase 1.0.0) # the Realtime Database
 find_or_install_package(sc-office simply-cpp-office-dev simply-cpp-office 1.11.0)
-# An insurer's capital and reserving calculations (sc_fsc_emv, sc_fsc_solve_risk_prem).
-find_or_install_package(sc-fsc simply-cpp-fsc-dev simply-cpp-fsc 1.0.0)
 # What 1web's plperlu and plpython3u functions did (sc_text.cpp): HTML entities, bounces, HTTP GET.
 find_or_install_package(sc-web simply-cpp-web-dev simply-cpp-web 1.5.0)
 find_or_install_package(sc-mime simply-cpp-mime-dev simply-cpp-mime 1.3.1)
@@ -100,7 +98,7 @@ message(STATUS "Building for ${SC_PGLIB_PG_VERSION} (${SC_PGLIB_PG_CONFIG})")
 # A module PostgreSQL loads with dlopen(), so no "lib" prefix and no link against the server:
 # its symbols resolve at load time. macOS needs that said explicitly, and PostgreSQL 16 and
 # later look for ".dylib" there.
-add_library(sc_pglib MODULE src/sc_pglib.cpp src/sc_redis.cpp src/sc_firebase.cpp src/firebase_rows.cpp src/sc_xlsx.cpp src/xlsx_format.cpp src/sc_files.cpp src/folders.cpp src/sc_fsc.cpp src/sc_oneweb.cpp src/oneweb.cpp src/sc_text.cpp src/http_allowed.cpp)
+add_library(sc_pglib MODULE src/sc_pglib.cpp src/sc_redis.cpp src/sc_firebase.cpp src/firebase_rows.cpp src/sc_xlsx.cpp src/xlsx_format.cpp src/sc_files.cpp src/folders.cpp src/sc_fsc.cpp src/fsc/fsc.cpp src/sc_oneweb.cpp src/oneweb.cpp src/sc_text.cpp src/http_allowed.cpp)
 target_include_directories(sc_pglib PRIVATE "${SC_PGLIB_PG_INCLUDEDIR}")
 # sc::sc-redis brings sc::sc-core (base64) with it.
 target_link_libraries(sc_pglib PRIVATE sc::sc-redis)
@@ -109,9 +107,7 @@ target_link_libraries(sc_pglib PRIVATE sc::sc-firebase-shared)
 # sc-office's shared library (its zip and XML underneath come with it), as sc-phplib links it.
 target_link_libraries(sc_pglib PRIVATE $<TARGET_LINKER_FILE:sc::sc-office-shared>)
 target_include_directories(sc_pglib PRIVATE $<TARGET_PROPERTY:sc::sc-office-shared,INTERFACE_INCLUDE_DIRECTORIES>)
-target_link_libraries(sc_pglib PRIVATE $<TARGET_LINKER_FILE:sc::sc-fsc-shared>)
 target_link_libraries(sc_pglib PRIVATE sc::sc-web-shared sc::sc-mime-shared sc::sc-http-shared)
-target_include_directories(sc_pglib PRIVATE $<TARGET_PROPERTY:sc::sc-fsc-shared,INTERFACE_INCLUDE_DIRECTORIES>)
 # sc_oneweb: libcurl and OpenSSL's HMAC, linked by name (CURL::libcurl's include folder upsets
 # libc++'s headers on macOS); the user agent says the version.
 find_package(OpenSSL REQUIRED)
@@ -164,9 +160,15 @@ if (SC_PGLIB_BUILD_TESTS)
     target_link_libraries(test-oneweb PRIVATE curl OpenSSL::Crypto nlohmann_json::nlohmann_json)
     add_test(NAME test-oneweb COMMAND test-oneweb)
     set_tests_properties(test-oneweb PROPERTIES LABELS unit)
+    # An insurer's capital and reserving calculations (src/fsc, once the sc-fsc module), without PostgreSQL.
+    add_executable(test-fsc tests/fsc.cpp src/fsc/fsc.cpp)
+    target_include_directories(test-fsc PRIVATE src tests)
+    target_link_libraries(test-fsc PRIVATE sc::sc-core)
+    add_test(NAME test-fsc COMMAND test-fsc)
+    set_tests_properties(test-fsc PROPERTIES LABELS unit)
 endif ()
 
 #############
 # Packaging #
 #############
-package_sc_module(DEPENDS "postgresql-${SC_PGLIB_PG_MAJOR}" "simply-cpp (>= 2.1.0~)" "simply-cpp-office (>= 1.11.0~)" "simply-cpp-firebase (>= 1.0.2~)" "simply-cpp-fsc (>= 1.0.0~)" "simply-cpp-http (>= 1.1.0~)" "simply-cpp-web (>= 1.5.0~)" "simply-cpp-mime (>= 1.3.1~)")
+package_sc_module(DEPENDS "postgresql-${SC_PGLIB_PG_MAJOR}" "simply-cpp (>= 2.1.0~)" "simply-cpp-office (>= 1.11.0~)" "simply-cpp-firebase (>= 1.0.2~)" "simply-cpp-http (>= 1.1.0~)" "simply-cpp-web (>= 1.5.0~)" "simply-cpp-mime (>= 1.3.1~)")
