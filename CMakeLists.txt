@@ -20,11 +20,11 @@ message(STATUS "SimplyCPP ${SC_MODULE} Version: ${SC_VERSION}")
 # Dependencies #
 ################
 find_or_install_package(sc-core simply-cpp-dev simply-cpp 3.0.0) # ip_endpoint::host_name (sc_reverse_dns)
-find_or_install_package(sc-redis simply-cpp-redis-dev simply-cpp-redis 2.0.0) # linked statically; 1.6.0: commands go to their slot's master
-find_or_install_package(sc-firebase simply-cpp-firebase-dev simply-cpp-firebase 2.0.0) # the Realtime Database
-find_or_install_package(sc-office simply-cpp-office-dev simply-cpp-office 2.0.0)
+find_or_install_package(sc-redis simply-cpp-redis-dev simply-cpp-redis 3.0.0) # linked statically; 1.6.0: commands go to their slot's master
+find_or_install_package(sc-firebase simply-cpp-firebase-dev simply-cpp-firebase 3.0.0) # the Realtime Database
+find_or_install_package(sc-office simply-cpp-office-dev simply-cpp-office 3.0.0)
 # What 1web's plperlu and plpython3u functions did (sc_text.cpp): HTML entities, bounces, HTTP GET.
-find_or_install_package(sc-web simply-cpp-web-dev simply-cpp-web 2.0.0)
+find_or_install_package(sc-web simply-cpp-web-dev simply-cpp-web 2.1.0)
 find_or_install_package(sc-mime simply-cpp-mime-dev simply-cpp-mime 2.0.0)
 find_or_install_package(sc-http simply-cpp-http-dev simply-cpp-http 2.0.0)
 
@@ -171,4 +171,4 @@ endif ()
 #############
 # Packaging #
 #############
-package_sc_module(DEPENDS "simply-cpp-redis (>= 2.0.0~)" "postgresql-${SC_PGLIB_PG_MAJOR}" "simply-cpp (>= 3.0.0~)" "simply-cpp-office (>= 2.0.0~)" "simply-cpp-firebase (>= 2.0.0~)" "simply-cpp-http (>= 2.0.0~)" "simply-cpp-web (>= 2.0.0~)" "simply-cpp-mime (>= 2.0.0~)")
+package_sc_module(DEPENDS "simply-cpp-redis (>= 3.0.0~)" "postgresql-${SC_PGLIB_PG_MAJOR}" "simply-cpp (>= 3.0.0~)" "simply-cpp-office (>= 3.0.0~)" "simply-cpp-firebase (>= 3.0.0~)" "simply-cpp-http (>= 2.0.0~)" "simply-cpp-web (>= 2.1.0~)" "simply-cpp-mime (>= 2.0.0~)")

@@ -83,8 +83,8 @@ namespace {
         PG_RETURN_TEXT_P(result);
     }
 
-    std::string encode(const std::string_view text) { return sc::html::encode_entities(text); }
-    std::string decode(const std::string_view text) { return sc::html::decode_entities(text); }
+    std::string encode(const std::string_view text) { return sc::web::encode_entities(text); }
+    std::string decode(const std::string_view text) { return sc::web::decode_entities(text); }
     std::string uri(const std::string_view text) { return sc::rest::url_encode(text); }
 
     // The address' name, or nullptr when it has none. Never raises.

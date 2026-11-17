@@ -76,7 +76,7 @@
 #include <sc/archive/codec.h>
 #include <sc/archive/codec_gzip.h>
 #include <sc/archive/sc_archive.h>
-#include <sc/office/sc_csv.h>
+#include <sc/office/csv.h>
 
 #include <nlohmann/json.hpp>
 
