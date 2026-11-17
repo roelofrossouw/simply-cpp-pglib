@@ -25,11 +25,11 @@
 #include <string>
 #include <vector>
 
-#include <html_entities.h>
-#include <ip_endpoint.h>
+#include <sc/web/html_entities.h>
+#include <sc/core/ip_endpoint.h>
 #include <nlohmann/json.hpp>
-#include <rest.h>
-#include <sc_mime.h>
+#include <sc/http/rest.h>
+#include <sc/mime/sc_mime.h>
 
 #include "http_allowed.h"
 #include "paths.h"

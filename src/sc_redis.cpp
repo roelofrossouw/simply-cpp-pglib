@@ -12,8 +12,8 @@
 // failures are WARNINGs and the call returns false or NULL, so a trigger never breaks the
 // statement that fired it; with on_error 'error' they are ERRORs.
 
-#include <ip_endpoints.h>
-#include <redis.h>
+#include <sc/core/ip_endpoints.h>
+#include <sc/redis/redis.h>
 
 #include <cerrno>
 #include <chrono>

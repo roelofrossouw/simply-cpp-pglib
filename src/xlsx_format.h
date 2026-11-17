@@ -6,7 +6,7 @@
 //   {"freeze_panes": "B2", "autofilter": true, "style": {"font": "Arial", "font_size": 10},
 //    "columns": {"price": "currency"}, "format": {"A": {"width": 30}, "F2:F999": {"bold": true}}}
 
-#include <excel.h>
+#include <sc/office/excel.h>
 
 #include <nlohmann/json.hpp>
 

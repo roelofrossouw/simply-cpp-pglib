@@ -1,7 +1,7 @@
 // The sc_pglib module: its PostgreSQL magic block, its settings and the base64 functions. The rules for
 // mixing C++ and PostgreSQL are in pg_glue.h; the Redis functions are in sc_redis.cpp.
 
-#include <base64.h>
+#include <sc/core/base64.h>
 
 #include <exception>
 #include <string>

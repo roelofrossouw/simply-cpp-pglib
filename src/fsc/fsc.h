@@ -14,7 +14,7 @@
 // Rates are nominal annual rates as fractions (0.085 is 8.5%), compounded daily over 365.25 days a year:
 // a flow of amount A in d days is worth A (1 + (spot + premium + spread) / 365.25)^-d today.
 
-#include <dual.h>
+#include <sc/core/dual.h>
 
 #include <initializer_list>
 #include <span>

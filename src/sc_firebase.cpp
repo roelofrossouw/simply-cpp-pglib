@@ -13,7 +13,7 @@
 //
 // The wrapper's handler also makes foreign tables of it, read and written: see the end of the file.
 
-#include <sc_firebase.h>
+#include <sc/firebase/sc_firebase.h>
 
 #include "firebase_rows.h"
 
