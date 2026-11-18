@@ -1,4 +1,4 @@
-// Redis from SQL (sc::redis). Connection settings live in PostgreSQL's foreign server catalog,
+// Redis from SQL (sc::redis::client). Connection settings live in PostgreSQL's foreign server catalog,
 // as dblink and postgres_fdw do it: a server of the sc_redis foreign data wrapper holds the
 // Redis servers and timeouts, and an optional user mapping holds the password.
 //
@@ -164,7 +164,7 @@ namespace {
 
     struct client_entry {
         std::string signature; // the settings it was made with
-        std::unique_ptr<sc::redis> client;
+        std::unique_ptr<sc::redis::client> client;
         std::chrono::steady_clock::time_point retry_at{}; // after an outage: not tried before this
     };
 
@@ -259,7 +259,7 @@ namespace {
         return strings;
     }
 
-    // Runs command (sc::redis &, outcome &) on s's client, connecting first if needed.
+    // Runs command (sc::redis::client &, outcome &) on s's client, connecting first if needed.
     template<typename Command>
     outcome run(const settings &s, Command command) noexcept {
         outcome result;
@@ -281,15 +281,15 @@ namespace {
                     }
                     return result;
                 }
-                sc::redis_options options;
+                sc::redis::options options;
                 options.password = s.password ? s.password : "";
                 options.connect_timeout = std::chrono::milliseconds{s.connect_timeout_ms};
                 options.command_timeout = std::chrono::milliseconds{s.timeout_ms};
-                entry->client = std::make_unique<sc::redis>(sc::ip_endpoints{s.servers}, options);
+                entry->client = std::make_unique<sc::redis::client>(sc::ip_endpoints{s.servers}, options);
             }
             command(*entry->client, result);
             result.done = true;
-        } catch (const sc::redis_unavailable &exception) {
+        } catch (const sc::redis::unavailable &exception) {
             if (entry) {
                 entry->client.reset();
                 entry->retry_at = std::chrono::steady_clock::now() + std::chrono::milliseconds{s.retry_interval_ms};
@@ -382,7 +382,7 @@ extern "C" Datum sc_redis_set(PG_FUNCTION_ARGS) {
     // Fetched (and detoasted, which may allocate) before the C++ part.
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
     const std::string_view value = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(2));
-    const outcome result = run(s, [key, value](sc::redis &redis, outcome &) {
+    const outcome result = run(s, [key, value](sc::redis::client &redis, outcome &) {
         redis.set(std::string{key}, std::string{value});
     });
     result.error.raise();
@@ -393,7 +393,7 @@ extern "C" Datum sc_redis_set(PG_FUNCTION_ARGS) {
 extern "C" Datum sc_redis_get(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
-    return text_result(run(s, [key](sc::redis &redis, outcome &out) {
+    return text_result(run(s, [key](sc::redis::client &redis, outcome &out) {
         if (const auto value = redis.get(std::string{key})) out.value = sc_pglib::new_varlena(*value, out.error);
     }), fcinfo);
 }
@@ -402,7 +402,7 @@ extern "C" Datum sc_redis_get(PG_FUNCTION_ARGS) {
 extern "C" Datum sc_redis_del(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
-    return count_result(run(s, [key](sc::redis &redis, outcome &out) {
+    return count_result(run(s, [key](sc::redis::client &redis, outcome &out) {
         out.count = static_cast<long long>(redis.erase(std::string{key}));
     }), fcinfo);
 }
@@ -413,7 +413,7 @@ extern "C" Datum sc_redis_hset(PG_FUNCTION_ARGS) {
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
     const std::string_view field = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(2));
     const std::string_view value = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(3));
-    const outcome result = run(s, [key, field, value](sc::redis &redis, outcome &) {
+    const outcome result = run(s, [key, field, value](sc::redis::client &redis, outcome &) {
         redis.hset(std::string{key}, std::string{field}, std::string{value});
     });
     result.error.raise();
@@ -425,7 +425,7 @@ extern "C" Datum sc_redis_hget(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
     const std::string_view field = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(2));
-    return text_result(run(s, [key, field](sc::redis &redis, outcome &out) {
+    return text_result(run(s, [key, field](sc::redis::client &redis, outcome &out) {
         if (const auto value = redis.hget(std::string{key}, std::string{field})) {
             out.value = sc_pglib::new_varlena(*value, out.error);
         }
@@ -437,7 +437,7 @@ extern "C" Datum sc_redis_hmget(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
     const text_list fields = texts_from(PG_GETARG_ARRAYTYPE_P(2), "fields");
-    return jsonb_result(run(s, [key, fields](sc::redis &redis, outcome &out) {
+    return jsonb_result(run(s, [key, fields](sc::redis::client &redis, outcome &out) {
         const auto names = strings_from(fields);
         const auto values = redis.hmget(std::string{key}, names);
         json_pairs pairs;
@@ -452,7 +452,7 @@ extern "C" Datum sc_redis_hmget(PG_FUNCTION_ARGS) {
 extern "C" Datum sc_redis_hgetall(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
-    return jsonb_result(run(s, [key](sc::redis &redis, outcome &out) {
+    return jsonb_result(run(s, [key](sc::redis::client &redis, outcome &out) {
         const auto hash = redis.hgetall(std::string{key});
         json_pairs pairs;
         for (const auto &[field, value]: hash) pairs.emplace_back(field, value);
@@ -465,7 +465,7 @@ extern "C" Datum sc_redis_sadd(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
     const std::string_view member = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(2));
-    return count_result(run(s, [key, member](sc::redis &redis, outcome &out) {
+    return count_result(run(s, [key, member](sc::redis::client &redis, outcome &out) {
         out.count = static_cast<long long>(redis.sadd(std::string{key}, std::string{member}));
     }), fcinfo);
 }
@@ -475,7 +475,7 @@ extern "C" Datum sc_redis_sadd_many(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
     const text_list members = texts_from(PG_GETARG_ARRAYTYPE_P(2), "members");
-    return count_result(run(s, [key, members](sc::redis &redis, outcome &out) {
+    return count_result(run(s, [key, members](sc::redis::client &redis, outcome &out) {
         out.count = static_cast<long long>(redis.sadd(std::string{key}, strings_from(members)));
     }), fcinfo);
 }
@@ -485,7 +485,7 @@ extern "C" Datum sc_redis_srem(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
     const std::string_view member = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(2));
-    return count_result(run(s, [key, member](sc::redis &redis, outcome &out) {
+    return count_result(run(s, [key, member](sc::redis::client &redis, outcome &out) {
         out.count = static_cast<long long>(redis.srem(std::string{key}, std::string{member}));
     }), fcinfo);
 }
@@ -495,7 +495,7 @@ extern "C" Datum sc_redis_srem_many(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
     const text_list members = texts_from(PG_GETARG_ARRAYTYPE_P(2), "members");
-    return count_result(run(s, [key, members](sc::redis &redis, outcome &out) {
+    return count_result(run(s, [key, members](sc::redis::client &redis, outcome &out) {
         out.count = static_cast<long long>(redis.srem(std::string{key}, strings_from(members)));
     }), fcinfo);
 }
@@ -504,7 +504,7 @@ extern "C" Datum sc_redis_srem_many(PG_FUNCTION_ARGS) {
 extern "C" Datum sc_redis_scard(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
-    return count_result(run(s, [key](sc::redis &redis, outcome &out) {
+    return count_result(run(s, [key](sc::redis::client &redis, outcome &out) {
         out.count = static_cast<long long>(redis.scard(std::string{key}));
     }), fcinfo);
 }
@@ -513,7 +513,7 @@ extern "C" Datum sc_redis_scard(PG_FUNCTION_ARGS) {
 extern "C" Datum sc_redis_smembers(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
-    const outcome result = run(s, [key](sc::redis &redis, outcome &out) {
+    const outcome result = run(s, [key](sc::redis::client &redis, outcome &out) {
         const auto members = redis.smembers(std::string{key});
         if (members.empty()) return;
         auto *items = static_cast<Datum *>(sc_pglib::alloc_no_oom(sizeof(Datum) * members.size(), out.error));
@@ -538,7 +538,7 @@ extern "C" Datum sc_redis_sismember(PG_FUNCTION_ARGS) {
     const settings s = settings_for(PG_GETARG_TEXT_PP(0));
     const std::string_view key = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(1));
     const std::string_view member = sc_pglib::varlena_bytes(PG_GETARG_VARLENA_PP(2));
-    const outcome result = run(s, [key, member](sc::redis &redis, outcome &out) {
+    const outcome result = run(s, [key, member](sc::redis::client &redis, outcome &out) {
         out.found = redis.sismember(std::string{key}, std::string{member});
     });
     result.error.raise();

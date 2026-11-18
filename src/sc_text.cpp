@@ -28,8 +28,8 @@
 #include <sc/web/html_entities.h>
 #include <sc/core/ip_endpoint.h>
 #include <nlohmann/json.hpp>
-#include <sc/http/rest.h>
-#include <sc/mime/sc_mime.h>
+#include <sc/http/client.h>
+#include <sc/mime/mime.h>
 
 #include "http_allowed.h"
 #include "paths.h"
@@ -85,7 +85,7 @@ namespace {
 
     std::string encode(const std::string_view text) { return sc::web::encode_entities(text); }
     std::string decode(const std::string_view text) { return sc::web::decode_entities(text); }
-    std::string uri(const std::string_view text) { return sc::rest::url_encode(text); }
+    std::string uri(const std::string_view text) { return sc::http::client::url_encode(text); }
 
     // The address' name, or nullptr when it has none. Never raises.
     char *host_name(const char *address, sc_pglib::pending_error &error) noexcept {
@@ -202,10 +202,10 @@ namespace {
                 if (!given.is_object()) throw std::invalid_argument("params is a JSON object of the query's parameters");
                 std::string query;
                 for (const auto &[name, value]: given.items())
-                    query += (query.empty() ? "" : "&") + sc::rest::url_encode(name) + "=" + sc::rest::url_encode(parameter_value(value));
+                    query += (query.empty() ? "" : "&") + sc::http::client::url_encode(name) + "=" + sc::http::client::url_encode(parameter_value(value));
                 if (!query.empty()) address += (address.find('?') == std::string::npos ? "?" : "&") + query;
             }
-            sc::rest call{address};
+            sc::http::client call{address};
             call.timeout((timeout_ms + 999) / 1000).connect_timeout(10).quiet();
             if (headers) {
                 const auto given = nlohmann::json::parse(headers);

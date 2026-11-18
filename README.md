@@ -474,7 +474,7 @@ SELECT sc_http_get('https://csv.webfleet.com/extern', '{"action": "showVideoLink
 
 ## Redis
 
-`sc_pglib` talks to Redis (standalone or Cluster) through `sc::redis`, mainly
+`sc_pglib` talks to Redis (standalone or Cluster) through `sc::redis::client`, mainly
 so triggers can keep Redis up to date for other programs to read. Connection
 settings are a foreign server of the `sc_redis` wrapper, as `dblink` does it:
 
